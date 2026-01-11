@@ -22,5 +22,6 @@ go.work
 
 # IDE specific
 .idea/
+KODA.md
 .vscode/
 *.swp
