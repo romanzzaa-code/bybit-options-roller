@@ -1,55 +1,26 @@
-# --- Python Core ---
-__pycache__/
-*.py[cod]
-*$py.class
-venv/
-.env
-.pytest_cache/
-*.egg-info/
-
-# --- C++ & CMake Build Artifacts ---
-# Папки сборки (куда будем компилировать)
-build/
-cmake-build-*/
-out/
-bin/
-
-# Файлы, генерируемые CMake (если случайно запустишь cmake в корне)
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-compile_commands.json
-
-# Скомпилированные библиотеки и объекты
-*.o
-*.obj
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
 *.so
 *.dylib
-*.dll
-*.a
-*.lib
-*.exe
 
-# --- HFT Data & Logs ---
-*.log
-*.db
-*.sqlite
-timescaledb_data/
-# Игнорируем тяжелые дампы данных для бэктестов (.npz по твоему ТЗ)
-*.npz
-data/
+# Test binary, built with `go test -c`
+*.test
 
-# --- IDE & OS Junk ---
-.vscode/
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (installed by 'go mod vendor')
+vendor/
+
+# Go workspace file
+go.work
+
+# Environment variables
+.env
+
+# IDE specific
 .idea/
-.DS_Store
-Thumbs.db
+.vscode/
 *.swp
-*.swo
-
-# --- Secrets (Safety First!) ---
-secrets.py
-config_local.yaml
-*.key
-*.pem
