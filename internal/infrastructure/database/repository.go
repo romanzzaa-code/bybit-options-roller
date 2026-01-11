@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"time"
+	"time" // ДОБАВЛЕНО
 
 	"github.com/romanzzaa/bybit-options-roller/internal/domain"
 	"github.com/romanzzaa/bybit-options-roller/internal/infrastructure/crypto"
@@ -23,110 +23,48 @@ func NewTaskRepository(db *DB, encryptor *crypto.Encryptor) *TaskRepository {
 	}
 }
 
+// CreateTask создает задачу. Version по дефолту = 1.
 func (r *TaskRepository) CreateTask(ctx context.Context, task *domain.Task) error {
 	query := `
 		INSERT INTO tasks (
-			user_id, api_key_id, target_symbol, current_qty,
-			trigger_price, next_strike_step, status, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+			user_id, api_key_id, target_symbol, underlying_symbol, current_qty,
+			trigger_price, next_strike_step, status, version, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, NOW(), NOW())
 		RETURNING id
 	`
 
+	// В базе поле называется target_symbol (старое название), но мапим мы его из CurrentOptionSymbol
 	err := r.db.QueryRowContext(
 		ctx, query,
-		task.UserID, task.APIKeyID, task.TargetSymbol, task.CurrentQty,
+		task.UserID, task.APIKeyID, task.CurrentOptionSymbol, task.UnderlyingSymbol, task.CurrentQty,
 		task.TriggerPrice, task.NextStrikeStep, task.Status,
 	).Scan(&task.ID)
 
 	if err != nil {
 		return fmt.Errorf("failed to create task: %w", err)
 	}
-
+	task.Version = 1
 	return nil
 }
 
 func (r *TaskRepository) GetTaskByID(ctx context.Context, id int64) (*domain.Task, error) {
 	query := `
-		SELECT id, user_id, api_key_id, target_symbol, current_qty,
-			   trigger_price, next_strike_step, status, last_error,
+		SELECT id, user_id, api_key_id, target_symbol, underlying_symbol, current_qty,
+			   trigger_price, next_strike_step, status, version, last_error,
 			   created_at, updated_at
 		FROM tasks
 		WHERE id = $1
 	`
-
-	task := &domain.Task{}
-	var lastError sql.NullString
-
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&task.ID, &task.UserID, &task.APIKeyID, &task.TargetSymbol, &task.CurrentQty,
-		&task.TriggerPrice, &task.NextStrikeStep, &task.Status, &lastError,
-		&task.CreatedAt, &task.UpdatedAt,
-	)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get task: %w", err)
-	}
-
-	if lastError.Valid {
-		task.LastError = lastError.String
-	}
-
-	return task, nil
-}
-
-func (r *TaskRepository) GetTasksBySymbol(ctx context.Context, symbol string) ([]domain.Task, error) {
-	query := `
-		SELECT id, user_id, api_key_id, target_symbol, current_qty,
-			   trigger_price, next_strike_step, status, last_error,
-			   created_at, updated_at
-		FROM tasks
-		WHERE target_symbol = $1 AND status = 'active'
-	`
-
-	rows, err := r.db.QueryContext(ctx, query, symbol)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tasks by symbol: %w", err)
-	}
-	defer rows.Close()
-
-	var tasks []domain.Task
-	for rows.Next() {
-		var task domain.Task
-		var lastError sql.NullString
-
-		err := rows.Scan(
-			&task.ID, &task.UserID, &task.APIKeyID, &task.TargetSymbol, &task.CurrentQty,
-			&task.TriggerPrice, &task.NextStrikeStep, &task.Status, &lastError,
-			&task.CreatedAt, &task.UpdatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan task: %w", err)
-		}
-
-		if lastError.Valid {
-			task.LastError = lastError.String
-		}
-
-		tasks = append(tasks, task)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration error: %w", err)
-	}
-
-	return tasks, nil
+	return r.scanTask(r.db.QueryRowContext(ctx, query, id))
 }
 
 func (r *TaskRepository) GetActiveTasks(ctx context.Context) ([]domain.Task, error) {
 	query := `
-		SELECT id, user_id, api_key_id, target_symbol, current_qty,
-			   trigger_price, next_strike_step, status, last_error,
+		SELECT id, user_id, api_key_id, target_symbol, underlying_symbol, current_qty,
+			   trigger_price, next_strike_step, status, version, last_error,
 			   created_at, updated_at
 		FROM tasks
-		WHERE status = 'active'
+		WHERE status IN ('IDLE', 'ROLL_INITIATED', 'LEG1_CLOSED')
 	`
 
 	rows, err := r.db.QueryContext(ctx, query)
@@ -137,76 +75,111 @@ func (r *TaskRepository) GetActiveTasks(ctx context.Context) ([]domain.Task, err
 
 	var tasks []domain.Task
 	for rows.Next() {
-		var task domain.Task
-		var lastError sql.NullString
-
-		err := rows.Scan(
-			&task.ID, &task.UserID, &task.APIKeyID, &task.TargetSymbol, &task.CurrentQty,
-			&task.TriggerPrice, &task.NextStrikeStep, &task.Status, &lastError,
-			&task.CreatedAt, &task.UpdatedAt,
-		)
+		task, err := r.scanRow(rows)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan task: %w", err)
+			return nil, err
 		}
-
-		if lastError.Valid {
-			task.LastError = lastError.String
-		}
-
-		tasks = append(tasks, task)
+		tasks = append(tasks, *task)
 	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration error: %w", err)
-	}
-
 	return tasks, nil
 }
 
-func (r *TaskRepository) UpdateTaskStatus(ctx context.Context, id int64, status domain.TaskState, errMessage string) error {
+func (r *TaskRepository) UpdateTaskState(ctx context.Context, id int64, newState domain.TaskState, version int64) error {
 	query := `
 		UPDATE tasks
-		SET status = $1, last_error = $2, updated_at = NOW()
-		WHERE id = $3
+		SET status = $1, version = version + 1, updated_at = NOW()
+		WHERE id = $2 AND version = $3
 	`
 
-	var lastErr *string
-	if errMessage != "" {
-		lastErr = &errMessage
-	}
-
-	result, err := r.db.ExecContext(ctx, query, status, lastErr, id)
+	result, err := r.db.ExecContext(ctx, query, newState, id, version)
 	if err != nil {
-		return fmt.Errorf("failed to update task status: %w", err)
+		return fmt.Errorf("db exec error: %w", err)
 	}
 
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
 	if rows == 0 {
-		return fmt.Errorf("task not found: %d", id)
+		return fmt.Errorf("optimistic locking failed: task %d modified concurrently", id)
 	}
 
 	return nil
 }
 
-func (r *TaskRepository) UpdateTaskSymbol(ctx context.Context, id int64, newSymbol string, newQty decimal.Decimal) error {
+func (r *TaskRepository) UpdateTaskSymbol(ctx context.Context, id int64, newSymbol string, newQty decimal.Decimal, version int64) error {
 	query := `
 		UPDATE tasks
-		SET target_symbol = $1, current_qty = $2, updated_at = NOW()
-		WHERE id = $3
+		SET target_symbol = $1, current_qty = $2, status = 'IDLE', version = version + 1, updated_at = NOW()
+		WHERE id = $3 AND version = $4
 	`
 
-	result, err := r.db.ExecContext(ctx, query, newSymbol, newQty, id)
+	result, err := r.db.ExecContext(ctx, query, newSymbol, newQty, id, version)
 	if err != nil {
-		return fmt.Errorf("failed to update task symbol: %w", err)
+		return fmt.Errorf("db exec error: %w", err)
 	}
 
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("task not found: %d", id)
+		return fmt.Errorf("optimistic locking failed on symbol update: task %d", id)
 	}
 
 	return nil
 }
+
+func (r *TaskRepository) SaveError(ctx context.Context, id int64, errMessage string) error {
+	query := `
+		UPDATE tasks
+		SET last_error = $1, status = 'FAILED', updated_at = NOW()
+		WHERE id = $2
+	`
+	_, err := r.db.ExecContext(ctx, query, errMessage, id)
+	return err
+}
+
+// Helpers
+
+func (r *TaskRepository) scanTask(row *sql.Row) (*domain.Task, error) {
+	task := &domain.Task{}
+	var lastError sql.NullString
+
+	// Тут мы сканируем поле БД target_symbol в поле структуры CurrentOptionSymbol
+	err := row.Scan(
+		&task.ID, &task.UserID, &task.APIKeyID, &task.CurrentOptionSymbol, &task.UnderlyingSymbol,
+		&task.CurrentQty, &task.TriggerPrice, &task.NextStrikeStep, &task.Status, &task.Version,
+		&lastError, &task.CreatedAt, &task.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("scan error: %w", err)
+	}
+	if lastError.Valid {
+		task.LastError = lastError.String
+	}
+	return task, nil
+}
+
+func (r *TaskRepository) scanRow(rows *sql.Rows) (*domain.Task, error) {
+	task := &domain.Task{}
+	var lastError sql.NullString
+
+	err := rows.Scan(
+		&task.ID, &task.UserID, &task.APIKeyID, &task.CurrentOptionSymbol, &task.UnderlyingSymbol,
+		&task.CurrentQty, &task.TriggerPrice, &task.NextStrikeStep, &task.Status, &task.Version,
+		&lastError, &task.CreatedAt, &task.UpdatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("scan row error: %w", err)
+	}
+	if lastError.Valid {
+		task.LastError = lastError.String
+	}
+	return task, nil
+}
+
+// ---------------- API Key & User Repositories ----------------
 
 type APIKeyRepository struct {
 	db        *DB
@@ -214,10 +187,7 @@ type APIKeyRepository struct {
 }
 
 func NewAPIKeyRepository(db *DB, encryptor *crypto.Encryptor) *APIKeyRepository {
-	return &APIKeyRepository{
-		db:        db,
-		encryptor: encryptor,
-	}
+	return &APIKeyRepository{db: db, encryptor: encryptor}
 }
 
 func (r *APIKeyRepository) Create(ctx context.Context, apiKey *domain.APIKey) error {

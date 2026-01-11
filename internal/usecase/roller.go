@@ -4,82 +4,80 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"regexp"
-	"strings"
 	"time"
 
 	"github.com/romanzzaa/bybit-options-roller/internal/domain"
-	"github.com/shopspring/decimal"
 )
 
 type RollerService struct {
-	exchange   domain.ExchangeAdapter
-	taskRepo   domain.TaskRepository
-	notifySvc  domain.NotificationService
+	exchange  domain.ExchangeAdapter
+	taskRepo  domain.TaskRepository
+	notifySvc domain.NotificationService
 }
 
-func NewRollerService(exchange domain.ExchangeAdapter) *RollerService {
+func NewRollerService(exchange domain.ExchangeAdapter, taskRepo domain.TaskRepository) *RollerService {
 	return &RollerService{
 		exchange: exchange,
+		taskRepo: taskRepo,
 	}
 }
 
-func (s *RollerService) WithTaskRepo(repo domain.TaskRepository) *RollerService {
-	s.taskRepo = repo
-	return s
-}
-
-func (s *RollerService) WithNotifySvc(svc domain.NotificationService) *RollerService {
-	s.notifySvc = svc
-	return s
-}
-
+// ExecuteRoll — Основной сценарий (Saga).
 func (s *RollerService) ExecuteRoll(ctx context.Context, apiKey domain.APIKey, task *domain.Task) error {
-	log.Printf("[Roller] Checking task for %s. Trigger: %s", task.TargetSymbol, task.TriggerPrice)
-
-	markPrice, err := s.exchange.GetMarkPrice(ctx, task.TargetSymbol)
+	// 1. Получаем цену БАЗОВОГО актива (Index Price), например BTCUSD
+	indexPrice, err := s.exchange.GetIndexPrice(ctx, task.UnderlyingSymbol)
 	if err != nil {
-		return fmt.Errorf("failed to get mark price: %w", err)
+		return fmt.Errorf("failed to get index price for %s: %w", task.UnderlyingSymbol, err)
 	}
 
-	isCall := strings.HasSuffix(task.TargetSymbol, "-C")
-	shouldRoll := false
-
-	if isCall {
-		if markPrice.GreaterThanOrEqual(task.TriggerPrice) {
-			shouldRoll = true
-		}
-	} else {
-		if markPrice.LessThanOrEqual(task.TriggerPrice) {
-			shouldRoll = true
-		}
-	}
-
-	if !shouldRoll {
-		log.Printf("[Roller] Price %s is safe (Trigger %s). No action.", markPrice, task.TriggerPrice)
+	// 2. Спрашиваем у доменной модели: "Пора?"
+	// Логика сравнения (>= или <=) теперь инкапсулирована в Task.
+	if !task.ShouldRoll(indexPrice) {
+		// Не спамим логами, если ничего делать не надо
 		return nil
 	}
 
-	log.Printf("🚨 TRIGGER HIT! %s MarkPrice: %s. Initiating ROLL sequence...", task.TargetSymbol, markPrice)
+	log.Printf("🚀 TRIGGER HIT! Task %d. %s Price: %s (Trigger: %s). Starting ROLL...", 
+		task.ID, task.UnderlyingSymbol, indexPrice, task.TriggerPrice)
 
-	position, err := s.exchange.GetPosition(ctx, apiKey, task.TargetSymbol)
+	// 3. Меняем статус на ROLL_INITIATED (блокируем задачу от других воркеров)
+	if err := s.taskRepo.UpdateTaskState(ctx, task.ID, domain.TaskStateRollInitiated, task.Version); err != nil {
+		return fmt.Errorf("failed to lock task (concurrency error?): %w", err)
+	}
+	// Обновляем версию в памяти, так как мы только что успешно обновили БД
+	task.Version++ 
+
+	// 4. Получаем реальную позицию
+	position, err := s.exchange.GetPosition(ctx, apiKey, task.CurrentOptionSymbol)
 	if err != nil {
-		return fmt.Errorf("failed to get position info: %w", err)
+		s.handleError(ctx, task, "Failed to fetch position")
+		return err
 	}
 
 	if position.Qty.IsZero() {
-		return fmt.Errorf("position %s not found on exchange, nothing to close", task.TargetSymbol)
+		s.handleError(ctx, task, "Position not found on exchange")
+		return fmt.Errorf("position %s is zero/missing", task.CurrentOptionSymbol)
 	}
 
-	log.Printf("[Leg 1] Closing old position: %s, Qty: %s", task.TargetSymbol, position.Qty)
+	// 5. Парсим текущий символ, чтобы вычислить следующий
+	currentSym, err := domain.ParseOptionSymbol(task.CurrentOptionSymbol)
+	if err != nil {
+		s.handleError(ctx, task, "Invalid symbol format")
+		return err
+	}
+	
+	// Вычисляем следующий страйк
+	nextSym := currentSym.NextStrike(task.NextStrikeStep)
+	log.Printf("[Roller] Plan: Close %s -> Open %s", currentSym, nextSym)
 
-	closeSide := "Buy" 
+	// --- LEG 1: Closing ---
+	closeSide := "Buy"
 	if position.Side == "Buy" {
 		closeSide = "Sell"
 	}
 
 	closeReq := domain.OrderRequest{
-		Symbol:      task.TargetSymbol,
+		Symbol:      task.CurrentOptionSymbol,
 		Side:        closeSide,
 		OrderType:   "Market",
 		Qty:         position.Qty,
@@ -87,68 +85,49 @@ func (s *RollerService) ExecuteRoll(ctx context.Context, apiKey domain.APIKey, t
 		OrderLinkID: fmt.Sprintf("close-%d-%d", task.ID, time.Now().Unix()),
 	}
 
-	orderID1, err := s.exchange.PlaceOrder(ctx, apiKey, closeReq)
-	if err != nil {
-		return fmt.Errorf("failed to close Leg 1: %w", err)
+	if _, err := s.exchange.PlaceOrder(ctx, apiKey, closeReq); err != nil {
+		s.handleError(ctx, task, "Leg 1 failed: "+err.Error())
+		return fmt.Errorf("leg 1 execution failed: %w", err)
 	}
-	log.Printf("✅ Leg 1 Closed. OrderID: %s", orderID1)
 
-	nextSymbol, err := s.calculateNextSymbol(task.TargetSymbol, task.NextStrikeStep, isCall)
-	if err != nil {
-		return fmt.Errorf("failed to calculate next symbol: %w", err)
+	// 6. CHECKPOINT: Сохраняем, что первая нога закрыта.
+	// Это критическая точка. Если упадем здесь — Recovery Worker увидит этот статус.
+	if err := s.taskRepo.UpdateTaskState(ctx, task.ID, domain.TaskStateLeg1Closed, task.Version); err != nil {
+		// Даже если не смогли записать в БД, идем дальше, так как ордер уже на бирже!
+		log.Printf("⚠️ CRITICAL DB ERROR: Failed to save LEG1_CLOSED state: %v", err)
+	} else {
+		task.Version++
 	}
-	log.Printf("[Leg 2] Opening new position: %s", nextSymbol)
 
-	openSide := position.Side
+	log.Printf("✅ Leg 1 Closed. Opening Leg 2...")
 
+	// --- LEG 2: Opening ---
 	openReq := domain.OrderRequest{
-		Symbol:      nextSymbol,
-		Side:        openSide,
+		Symbol:      nextSym.String(),
+		Side:        position.Side, // Открываем ту же сторону (Put/Call)
 		OrderType:   "Market",
 		Qty:         position.Qty,
 		OrderLinkID: fmt.Sprintf("open-%d-%d", task.ID, time.Now().Unix()),
 	}
 
-	orderID2, err := s.exchange.PlaceOrder(ctx, apiKey, openReq)
-	if err != nil {
-		return fmt.Errorf("🔥 CRITICAL: Leg 1 closed but Leg 2 FAILED! Manual check needed. Err: %w", err)
-	}
-	log.Printf("✅ Leg 2 Opened. OrderID: %s", orderID2)
-	log.Println("🎉 Roll execution completed successfully.")
-
-	if s.taskRepo != nil {
-		if err := s.taskRepo.UpdateTaskSymbol(ctx, task.ID, nextSymbol, position.Qty); err != nil {
-			log.Printf("[Roller] Failed to update task symbol: %v", err)
-		}
+	if _, err := s.exchange.PlaceOrder(ctx, apiKey, openReq); err != nil {
+		// ВОТ ТУТ НУЖЕН АЛЕРТ! Мы "голые".
+		// Ставим статус FAILED, чтобы админ увидел.
+		s.taskRepo.UpdateTaskState(ctx, task.ID, domain.TaskStateFailed, task.Version)
+		return fmt.Errorf("🔥 FATAL: Leg 1 done, Leg 2 FAILED. Position is NAKED! Err: %w", err)
 	}
 
+	// 7. Финал: обновляем задачу на новый символ и сбрасываем в IDLE
+	if err := s.taskRepo.UpdateTaskSymbol(ctx, task.ID, nextSym.String(), position.Qty, task.Version); err != nil {
+		log.Printf("⚠️ Failed to update task to new symbol: %v", err)
+		return err
+	}
+
+	log.Println("🎉 Roll sequence completed successfully.")
 	return nil
 }
 
-func (s *RollerService) calculateNextSymbol(currentSymbol string, step decimal.Decimal, isCall bool) (string, error) {
-	re := regexp.MustCompile(`^([A-Z]+)-(\d{1,2}[A-Z]{3}\d{2})-(\d+)-([CP])$`)
-	matches := re.FindStringSubmatch(currentSymbol)
-
-	if len(matches) != 5 {
-		return "", fmt.Errorf("invalid symbol format: %s", currentSymbol)
-	}
-
-	prefix := matches[1]
-	date := matches[2]
-	strikeStr := matches[3]
-	typeSuffix := matches[4]
-
-	strike, err := decimal.NewFromString(strikeStr)
-	if err != nil {
-		return "", fmt.Errorf("invalid strike: %s", strikeStr)
-	}
-
-	var newStrike decimal.Decimal
-	if isCall {
-		newStrike = strike.Add(step)
-	} else {
-		newStrike = strike.Sub(step)
-	}
-
-	return fmt.Sprintf("%s-%s-%s-%s", prefix, date, newStrike.String(), typeSuffix), nil
+func (s *RollerService) handleError(ctx context.Context, task *domain.Task, msg string) {
+	// Сбрасываем в ERROR, чтобы воркер не долбил бесконечно одну ошибку
+	_ = s.taskRepo.SaveError(ctx, task.ID, msg)
 }

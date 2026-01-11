@@ -42,11 +42,36 @@ func NewClient(isTestnet bool) *Client {
 
 // --- Implementation of ExchangeAdapter ---
 
-func (c *Client) GetMarkPrice(ctx context.Context, symbol string) (decimal.Decimal, error) {
-	// Для опционов category=option, но марк-цена базового актива может быть в linear.
-	// Пока предполагаем простой кейс получения тикера.
+// GetIndexPrice возвращает цену базового актива (например, BTC).
+// Используем Linear (USDT Perp) тикеры как самый надежный источник Index Price.
+func (c *Client) GetIndexPrice(ctx context.Context, symbol string) (decimal.Decimal, error) {
+	// Если пришел "BTC", превращаем в "BTCUSDT"
+	target := symbol
+	if !strings.HasSuffix(target, "USDT") && !strings.HasSuffix(target, "USD") {
+		target += "USDT"
+	}
+
 	params := map[string]string{
-		"category": "option", // Или linear, зависит от того, чей MarkPrice нужен
+		"category": "linear",
+		"symbol":   target,
+	}
+
+	var resp BaseResponse[TickerResponse]
+	if err := c.sendPublicRequest(ctx, "GET", "/v5/market/tickers", params, &resp); err != nil {
+		return decimal.Zero, err
+	}
+
+	if len(resp.Result.List) == 0 {
+		return decimal.Zero, fmt.Errorf("index price not found for %s", target)
+	}
+
+	// Берем MarkPrice или IndexPrice из ответа
+	return resp.Result.List[0].MarkPrice, nil
+}
+
+func (c *Client) GetMarkPrice(ctx context.Context, symbol string) (decimal.Decimal, error) {
+	params := map[string]string{
+		"category": "option",
 		"symbol":   symbol,
 	}
 	
@@ -64,7 +89,7 @@ func (c *Client) GetMarkPrice(ctx context.Context, symbol string) (decimal.Decim
 
 func (c *Client) GetPosition(ctx context.Context, creds domain.APIKey, symbol string) (domain.Position, error) {
 	params := map[string]string{
-		"category": "option", // В рамках Options Roller мы работаем с опционами
+		"category": "option",
 		"symbol":   symbol,
 	}
 
@@ -74,7 +99,7 @@ func (c *Client) GetPosition(ctx context.Context, creds domain.APIKey, symbol st
 	}
 
 	if len(resp.Result.List) == 0 {
-		return domain.Position{}, nil // Позиции нет, возвращаем пустую
+		return domain.Position{}, nil // Позиции нет
 	}
 
 	raw := resp.Result.List[0]
@@ -88,31 +113,7 @@ func (c *Client) GetPosition(ctx context.Context, creds domain.APIKey, symbol st
 	}, nil
 }
 
-func (c *Client) GetMarginInfo(ctx context.Context, creds domain.APIKey) (domain.MarginInfo, error) {
-	params := map[string]string{
-		"accountType": "UNIFIED",
-	}
-
-	var resp BaseResponse[WalletBalanceResponse]
-	// Обрати внимание: wallet-balance это GET запрос
-	if err := c.sendPrivateRequest(ctx, creds, "GET", "/v5/account/wallet-balance", params, nil, &resp); err != nil {
-		return domain.MarginInfo{}, err
-	}
-
-	if len(resp.Result.List) == 0 {
-		return domain.MarginInfo{}, fmt.Errorf("empty wallet balance")
-	}
-
-	wb := resp.Result.List[0]
-	return domain.MarginInfo{
-		TotalEquity:        wb.TotalEquity,
-		TotalMarginBalance: wb.TotalMarginBalance,
-		MMR:                wb.AccountMMRate,
-	}, nil
-}
-
 func (c *Client) PlaceOrder(ctx context.Context, creds domain.APIKey, req domain.OrderRequest) (string, error) {
-	// Подготовка JSON body для POST запроса
 	bodyParams := map[string]interface{}{
 		"category":    "option",
 		"symbol":      req.Symbol,
@@ -137,34 +138,49 @@ func (c *Client) PlaceOrder(ctx context.Context, creds domain.APIKey, req domain
 	return resp.Result.OrderID, nil
 }
 
-// --- Private Helpers (Signing & Request Logic) ---
+// --- Private Helpers ---
 
 func (c *Client) sendPublicRequest(ctx context.Context, method, endpoint string, params map[string]string, result interface{}) error {
-	// TODO: Реализовать, если понадобится. Пока копия sendPrivateRequest без заголовков подписи
-	// Public endpoint просто формирует URL с query params
-	return nil 
-}
-
-// sendPrivateRequest выполняет подписанный запрос (HMAC SHA256)
-func (c *Client) sendPrivateRequest(ctx context.Context, creds domain.APIKey, method, endpoint string, queryParams map[string]string, bodyParams map[string]interface{}, result interface{}) error {
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	
-	// 1. Формирование Query String (сортировка ключей не обязательна для Bybit, но полезна для дебага)
 	var queryString string
-	if len(queryParams) > 0 {
-		var keys []string
-		for k := range queryParams {
-			keys = append(keys, k)
-		}
-		// sort.Strings(keys) // Bybit V5 не требует строгой сортировки, но это good practice
+	if len(params) > 0 {
 		var parts []string
-		for _, k := range keys {
-			parts = append(parts, fmt.Sprintf("%s=%s", k, queryParams[k]))
+		for k, v := range params {
+			parts = append(parts, fmt.Sprintf("%s=%s", k, v))
 		}
 		queryString = strings.Join(parts, "&")
 	}
 
-	// 2. Формирование Body String
+	fullURL := c.baseURL + endpoint
+	if queryString != "" {
+		fullURL += "?" + queryString
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	return c.decodeResponse(resp.Body, result)
+}
+
+func (c *Client) sendPrivateRequest(ctx context.Context, creds domain.APIKey, method, endpoint string, queryParams map[string]string, bodyParams map[string]interface{}, result interface{}) error {
+	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+	
+	var queryString string
+	if len(queryParams) > 0 {
+		var parts []string
+		for k, v := range queryParams {
+			parts = append(parts, fmt.Sprintf("%s=%s", k, v))
+		}
+		queryString = strings.Join(parts, "&")
+	}
+
 	var bodyString string
 	if method == "POST" && bodyParams != nil {
 		jsonBytes, err := json.Marshal(bodyParams)
@@ -174,8 +190,6 @@ func (c *Client) sendPrivateRequest(ctx context.Context, creds domain.APIKey, me
 		bodyString = string(jsonBytes)
 	}
 
-	// 3. Генерация подписи
-	// Правило: timestamp + api_key + recv_window + (queryString OR jsonBodyString)
 	var payload string
 	if method == "GET" {
 		payload = ts + creds.Key + RecvWindow + queryString
@@ -185,7 +199,6 @@ func (c *Client) sendPrivateRequest(ctx context.Context, creds domain.APIKey, me
 
 	signature := generateSignature(payload, creds.Secret)
 
-	// 4. Создание запроса
 	fullURL := c.baseURL + endpoint
 	if queryString != "" {
 		fullURL += "?" + queryString
@@ -201,27 +214,27 @@ func (c *Client) sendPrivateRequest(ctx context.Context, creds domain.APIKey, me
 		return err
 	}
 
-	// 5. Заголовки
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-BAPI-API-KEY", creds.Key)
 	req.Header.Set("X-BAPI-SIGN", signature)
 	req.Header.Set("X-BAPI-TIMESTAMP", ts)
 	req.Header.Set("X-BAPI-RECV-WINDOW", RecvWindow)
 
-	// 6. Отправка и чтение
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	respBytes, err := io.ReadAll(resp.Body)
+	return c.decodeResponse(resp.Body, result)
+}
+
+func (c *Client) decodeResponse(body io.Reader, result interface{}) error {
+	respBytes, err := io.ReadAll(body)
 	if err != nil {
 		return err
 	}
 
-	// 7. Парсинг ошибки API
-	// Сначала читаем в базовую структуру, чтобы проверить RetCode
 	var base BaseResponse[interface{}]
 	if err := json.Unmarshal(respBytes, &base); err != nil {
 		return fmt.Errorf("failed to parse response: %v | Body: %s", err, string(respBytes))
@@ -231,7 +244,6 @@ func (c *Client) sendPrivateRequest(ctx context.Context, creds domain.APIKey, me
 		return fmt.Errorf("bybit api error: [%d] %s", base.RetCode, base.RetMsg)
 	}
 
-	// Если ок, парсим в целевую структуру
 	return json.Unmarshal(respBytes, result)
 }
 
