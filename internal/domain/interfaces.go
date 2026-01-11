@@ -2,41 +2,41 @@ package domain
 
 import (
 	"context"
+	"time"
 
 	"github.com/shopspring/decimal"
 )
 
-// TaskRepository - управление задачами в БД
 type TaskRepository interface {
-	// Получить задачи, которые нужно проверить для данного символа (быстрый поиск)
-	GetTasksBySymbol(ctx context.Context, symbol string) ([]Task, error)
-	
-	// Получить задачу по ID с блокировкой (для транзакций)
-	GetTaskByID(ctx context.Context, id int64) (*Task, error)
-	
-	// Обновить статус задачи
-	UpdateTaskStatus(ctx context.Context, id int64, status TaskState, errMessage string) error
-	
-	// Сохранить новую задачу
 	CreateTask(ctx context.Context, task *Task) error
+	GetTaskByID(ctx context.Context, id int64) (*Task, error)
+	GetTasksBySymbol(ctx context.Context, symbol string) ([]Task, error)
+	GetActiveTasks(ctx context.Context) ([]Task, error)
+	UpdateTaskStatus(ctx context.Context, id int64, status TaskState, errMessage string) error
+	UpdateTaskSymbol(ctx context.Context, id int64, newSymbol string, newQty decimal.Decimal) error
 }
 
-// ExchangeAdapter - адаптер к бирже (Bybit V5)
+type APIKeyRepository interface {
+	Create(ctx context.Context, apiKey *APIKey) error
+	GetByID(ctx context.Context, id int64) (*APIKey, error)
+	GetByUserID(ctx context.Context, userID int64) ([]APIKey, error)
+	Invalidate(ctx context.Context, id int64) error
+}
+
+type UserRepository interface {
+	Create(ctx context.Context, user *User) error
+	GetByTelegramID(ctx context.Context, telegramID int64) (*User, error)
+	UpdateSubscription(ctx context.Context, telegramID int64, expiresAt time.Time) error
+	IsActive(ctx context.Context, telegramID int64) (bool, error)
+}
+
 type ExchangeAdapter interface {
-	// Получить текущую цену (Mark Price)
 	GetMarkPrice(ctx context.Context, symbol string) (decimal.Decimal, error)
-	
-	// Получить позицию пользователя. Если позиции нет, вернуть пустую структуру, но не ошибку.
 	GetPosition(ctx context.Context, creds APIKey, symbol string) (Position, error)
-	
-	// Отправить ордер
 	PlaceOrder(ctx context.Context, creds APIKey, req OrderRequest) (string, error)
-	
-	// Проверить маржу (для RiskEngine)
 	GetMarginInfo(ctx context.Context, creds APIKey) (MarginInfo, error)
 }
 
-// NotificationService - уведомления в Telegram
 type NotificationService interface {
 	NotifyUser(userID int64, message string) error
 	NotifyAdmin(message string) error

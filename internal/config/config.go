@@ -1,21 +1,86 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"strconv"
 )
 
-// Config - глобальная конфигурация бота
 type Config struct {
-	Env          string // "local", "prod"
-	PostgresDSN  string // Ссылка для подключения к БД
-	BybitTestnet bool   // Использовать ли Testnet
+	Env          string
+	BybitTestnet bool
+	Database     DatabaseConfig
+	Crypto       CryptoConfig
 }
 
-// LoadConfig - загружает настройки (пока хардкод для старта, потом прикрутим os.Getenv)
+type DatabaseConfig struct {
+	Host     string
+	Port     int
+	User     string
+	Password string
+	DBName   string
+	SSLMode  string
+}
+
+func (d *DatabaseConfig) ConnectString() string {
+	return fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		d.Host, d.Port, d.User, d.Password, d.DBName, d.SSLMode,
+	)
+}
+
+type CryptoConfig struct {
+	EncryptionKey string
+}
+
 func LoadConfig() (*Config, error) {
+	env := getEnv("ENV", "local")
+	testnet := getEnvBool("BYBIT_TESTNET", true)
+
+	dbConfig := DatabaseConfig{
+		Host:     getEnv("DB_HOST", "localhost"),
+		Port:     getEnvInt("DB_PORT", 5432),
+		User:     getEnv("DB_USER", "bybit_roller"),
+		Password: getEnv("DB_PASSWORD", "secret_password"),
+		DBName:   getEnv("DB_NAME", "bybit_roller"),
+		SSLMode:  getEnv("DB_SSLMODE", "disable"),
+	}
+
+	cryptoConfig := CryptoConfig{
+		EncryptionKey: getEnv("ENCRYPTION_KEY", ""),
+	}
+
 	return &Config{
-		Env:          "local",
-		PostgresDSN:  os.Getenv("DATABASE_URL"), // Будем брать из ENV
-		BybitTestnet: true,                      // Пока безопасный режим по умолчанию
+		Env:          env,
+		BybitTestnet: testnet,
+		Database:     dbConfig,
+		Crypto:       cryptoConfig,
 	}, nil
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		b, err := strconv.ParseBool(value)
+		if err == nil {
+			return b
+		}
+	}
+	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		v, err := strconv.Atoi(value)
+		if err == nil {
+			return v
+		}
+	}
+	return defaultValue
 }

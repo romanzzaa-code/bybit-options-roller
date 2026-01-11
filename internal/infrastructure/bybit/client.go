@@ -183,7 +183,7 @@ func (c *Client) sendPrivateRequest(ctx context.Context, creds domain.APIKey, me
 		payload = ts + creds.Key + RecvWindow + bodyString
 	}
 
-	signature := generateSignature(payload, creds.SecretEnc) // Внимание: тут должен быть РАСШИФРОВАННЫЙ секрет. В реальном коде добавь дешифровку.
+	signature := generateSignature(payload, creds.Secret)
 
 	// 4. Создание запроса
 	fullURL := c.baseURL + endpoint
