@@ -3,24 +3,62 @@ package database
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"fmt"
-	"time" // ДОБАВЛЕНО
+	"time"
 
 	"github.com/romanzzaa/bybit-options-roller/internal/domain"
 	"github.com/romanzzaa/bybit-options-roller/internal/infrastructure/crypto"
 	"github.com/shopspring/decimal"
 )
 
+// --- TaskRepository ---
+
 type TaskRepository struct {
-	db        *DB
-	encryptor *crypto.Encryptor
+	db *DB
+	logger *slog.Logger
 }
 
-func NewTaskRepository(db *DB, encryptor *crypto.Encryptor) *TaskRepository {
+
+func NewTaskRepository(db *DB) *TaskRepository {
 	return &TaskRepository{
-		db:        db,
-		encryptor: encryptor,
+		db: db,
+		logger: logger,
 	}
+}
+
+func (r *TaskRepository) RegisterError(ctx context.Context, id int64, err error) error {
+	msg := err.Error()
+	
+	// Простая эвристика для классификации ошибок
+	isTransient := strings.Contains(msg, "timeout") || 
+		strings.Contains(msg, "deadline exceeded") || 
+		strings.Contains(msg, "502 Bad Gateway") ||
+		strings.Contains(msg, "504 Gateway Timeout")
+
+	var newState domain.TaskState
+	if isTransient {
+		// Оставляем IDLE (или специальный статус RETRY_PENDING), чтобы воркер подхватил снова
+		// Можно добавить инкремент счетчика попыток (retry_count)
+		newState = domain.TaskStateIdle 
+		r.logger.Warn("Transient error registered, scheduling retry", 
+			slog.Int64("task_id", id), 
+			slog.String("error", msg))
+	} else {
+		// Фатальная ошибка
+		newState = domain.TaskStateFailed
+		r.logger.Error("Fatal error registered, task failed", 
+			slog.Int64("task_id", id), 
+			slog.String("error", msg))
+	}
+
+	query := `
+		UPDATE tasks
+		SET last_error = $1, status = $2, updated_at = NOW()
+		WHERE id = $3
+	`
+	_, dbErr := r.db.ExecContext(ctx, query, msg, newState, id)
+	return dbErr
 }
 
 // CreateTask создает задачу. Version по дефолту = 1.
@@ -33,7 +71,6 @@ func (r *TaskRepository) CreateTask(ctx context.Context, task *domain.Task) erro
 		RETURNING id
 	`
 
-	// В базе поле называется target_symbol (старое название), но мапим мы его из CurrentOptionSymbol
 	err := r.db.QueryRowContext(
 		ctx, query,
 		task.UserID, task.APIKeyID, task.CurrentOptionSymbol, task.UnderlyingSymbol, task.CurrentQty,
@@ -101,6 +138,7 @@ func (r *TaskRepository) UpdateTaskState(ctx context.Context, id int64, newState
 		return err
 	}
 	if rows == 0 {
+		// Это важно для обработки гонки данных
 		return fmt.Errorf("optimistic locking failed: task %d modified concurrently", id)
 	}
 
@@ -143,7 +181,6 @@ func (r *TaskRepository) scanTask(row *sql.Row) (*domain.Task, error) {
 	task := &domain.Task{}
 	var lastError sql.NullString
 
-	// Тут мы сканируем поле БД target_symbol в поле структуры CurrentOptionSymbol
 	err := row.Scan(
 		&task.ID, &task.UserID, &task.APIKeyID, &task.CurrentOptionSymbol, &task.UnderlyingSymbol,
 		&task.CurrentQty, &task.TriggerPrice, &task.NextStrikeStep, &task.Status, &task.Version,

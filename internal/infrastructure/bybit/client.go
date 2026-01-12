@@ -29,6 +29,7 @@ type Client struct {
 	httpClient *http.Client
 }
 
+// NewClient создает клиент. Рекомендуется передавать таймаут из конфига, 
 func NewClient(isTestnet bool) *Client {
 	url := MainnetBaseURL
 	if isTestnet {
@@ -36,24 +37,20 @@ func NewClient(isTestnet bool) *Client {
 	}
 	return &Client{
 		baseURL:    url,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		// Таймаут должен быть коротким для Get-запросов, но для ордеров чуть больше.
+		// В идеале вынести в cfg.
+		httpClient: &http.Client{Timeout: timeout},
 	}
 }
 
 // --- Implementation of ExchangeAdapter ---
 
-// GetIndexPrice возвращает цену базового актива (например, BTC).
-// Используем Linear (USDT Perp) тикеры как самый надежный источник Index Price.
+// GetIndexPrice возвращает цену. 
+// ВАЖНО: Больше не модифицирует symbol. Логика "BTC" -> "BTCUSDT" вынесена в domain.
 func (c *Client) GetIndexPrice(ctx context.Context, symbol string) (decimal.Decimal, error) {
-	// Если пришел "BTC", превращаем в "BTCUSDT"
-	target := symbol
-	if !strings.HasSuffix(target, "USDT") && !strings.HasSuffix(target, "USD") {
-		target += "USDT"
-	}
-
 	params := map[string]string{
 		"category": "linear",
-		"symbol":   target,
+		"symbol":   symbol, // Используем как есть
 	}
 
 	var resp BaseResponse[TickerResponse]
@@ -62,10 +59,9 @@ func (c *Client) GetIndexPrice(ctx context.Context, symbol string) (decimal.Deci
 	}
 
 	if len(resp.Result.List) == 0 {
-		return decimal.Zero, fmt.Errorf("index price not found for %s", target)
+		return decimal.Zero, fmt.Errorf("index price not found for %s", symbol)
 	}
 
-	// Берем MarkPrice или IndexPrice из ответа
 	return resp.Result.List[0].MarkPrice, nil
 }
 

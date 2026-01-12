@@ -1,7 +1,7 @@
 package config
 
 import (
-	"fmt"
+	"time"
 	"os"
 	"strconv"
 )
@@ -9,8 +9,14 @@ import (
 type Config struct {
 	Env          string
 	BybitTestnet bool
+	Bybit        BybitConfig
 	Database     DatabaseConfig
 	Crypto       CryptoConfig
+}
+
+type BybitConfig struct{
+	BaseURL string
+	Timeout time.Duration
 }
 
 type DatabaseConfig struct {
@@ -56,6 +62,24 @@ func LoadConfig() (*Config, error) {
 		Database:     dbConfig,
 		Crypto:       cryptoConfig,
 	}, nil
+}
+
+func MustLoad() *Config {
+	// Заглушка для загрузки из ENV
+	timeoutStr := os.Getenv("BYBIT_TIMEOUT_SECONDS")
+	timeoutSec, _ := strconv.Atoi(timeoutStr)
+	if timeoutSec == 0 {
+		timeoutSec = 5 // Default
+	}
+
+	return &Config{
+		Env: "local",
+		Bybit: BybitConfig{
+			Timeout: time.Duration(timeoutSec) * time.Second,
+		},
+		BybitTestnet: true, // Example
+		// ... init other fields
+	}
 }
 
 func getEnv(key, defaultValue string) string {
