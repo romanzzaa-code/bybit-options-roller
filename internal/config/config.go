@@ -1,9 +1,10 @@
 package config
 
 import (
-	"time"
+	"fmt"
 	"os"
 	"strconv"
+	"time"
 )
 
 type Config struct {
@@ -14,7 +15,7 @@ type Config struct {
 	Crypto       CryptoConfig
 }
 
-type BybitConfig struct{
+type BybitConfig struct {
 	BaseURL string
 	Timeout time.Duration
 }
@@ -65,11 +66,10 @@ func LoadConfig() (*Config, error) {
 }
 
 func MustLoad() *Config {
-	// Заглушка для загрузки из ENV
 	timeoutStr := os.Getenv("BYBIT_TIMEOUT_SECONDS")
 	timeoutSec, _ := strconv.Atoi(timeoutStr)
 	if timeoutSec == 0 {
-		timeoutSec = 5 // Default
+		timeoutSec = 5
 	}
 
 	return &Config{
@@ -77,7 +77,7 @@ func MustLoad() *Config {
 		Bybit: BybitConfig{
 			Timeout: time.Duration(timeoutSec) * time.Second,
 		},
-		BybitTestnet: true, // Example
+		BybitTestnet: true,
 		// ... init other fields
 	}
 }

@@ -23,22 +23,19 @@ const (
 	RecvWindow     = "5000"
 )
 
-// Client реализует domain.ExchangeAdapter
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
 }
 
-// NewClient создает клиент. Рекомендуется передавать таймаут из конфига, 
-func NewClient(isTestnet bool) *Client {
+// NewClient теперь принимает timeout явно
+func NewClient(isTestnet bool, timeout time.Duration) *Client {
 	url := MainnetBaseURL
 	if isTestnet {
 		url = TestnetBaseURL
 	}
 	return &Client{
 		baseURL:    url,
-		// Таймаут должен быть коротким для Get-запросов, но для ордеров чуть больше.
-		// В идеале вынести в cfg.
 		httpClient: &http.Client{Timeout: timeout},
 	}
 }

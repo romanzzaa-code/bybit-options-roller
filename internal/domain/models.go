@@ -7,6 +7,15 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// --- Constants ---
+
+const (
+	SideBuy         = "Buy"
+	SideSell        = "Sell"
+	OrderTypeMarket = "Market"
+	OrderTypeLimit  = "Limit"
+)
+
 // --- State Machine ---
 
 type TaskState string
@@ -27,33 +36,29 @@ type Task struct {
 	UserID              int64
 	APIKeyID            int64
 	CurrentOptionSymbol string
-	UnderlyingSymbol    string // НОВОЕ ПОЛЕ
+	UnderlyingSymbol    string
 	CurrentQty          decimal.Decimal
 	TriggerPrice        decimal.Decimal
 	NextStrikeStep      decimal.Decimal
 	Status              TaskState
-	Version             int64 // НОВОЕ ПОЛЕ
+	Version             int64
 	LastError           string
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 }
 
-// IsCallOption определяет тип опциона
 func (t *Task) IsCallOption() bool {
 	return strings.HasSuffix(t.CurrentOptionSymbol, "-C")
 }
 
-// ShouldRoll проверяет условие роллирования
 func (t *Task) ShouldRoll(currentUnderlyingPrice decimal.Decimal) bool {
 	if t.Status != TaskStateIdle {
 		return false
 	}
 
 	if t.IsCallOption() {
-		// Call: Если цена БА >= триггер
 		return currentUnderlyingPrice.GreaterThanOrEqual(t.TriggerPrice)
 	} else {
-		// Put: Если цена БА <= триггер
 		return currentUnderlyingPrice.LessThanOrEqual(t.TriggerPrice)
 	}
 }

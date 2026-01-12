@@ -26,7 +26,10 @@ func main() {
 	logger.Info("Config loaded", slog.String("env", cfg.Env))
 
 	// 3. Infrastructure
-	dbConn, err := database.NewConnection(cfg.Database)
+	dbConn, err := database.NewConnection(database.Config{
+		Host: cfg.Database.Host, Port: cfg.Database.Port, User: cfg.Database.User,
+		Password: cfg.Database.Password, DBName: cfg.Database.DBName, SSLMode: cfg.Database.SSLMode,
+	})
 	if err != nil {
 		logger.Error("DB connection failed", slog.String("error", err.Error()))
 		os.Exit(1)

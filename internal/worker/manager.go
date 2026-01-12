@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -58,8 +59,6 @@ func (m *Manager) Run(ctx context.Context) {
 }
 
 func (m *Manager) processBatch(ctx context.Context, wg *sync.WaitGroup) {
-	// Создаем свой контекст для цикла выборки, чтобы не прерывать запросы к БД мгновенно
-	// но роллы должны уважать глобальный ctx при graceful shutdown
 	tasks, err := m.taskRepo.GetActiveTasks(ctx)
 	if err != nil {
 		m.logger.Error("Failed to fetch active tasks", slog.String("error", err.Error()))
@@ -82,24 +81,19 @@ func (m *Manager) processBatch(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 func (m *Manager) executeTask(ctx context.Context, task domain.Task) {
-	// Получаем API ключ для задачи
-	// Важно: в реальном коде стоит добавить кэширование ключей, чтобы не долбить БД
 	apiKey, err := m.apiKeyRepo.GetByID(ctx, task.APIKeyID)
 	if err != nil {
 		m.logger.Error("Failed to get API key", slog.Int64("task_id", task.ID), slog.String("error", err.Error()))
-		// Если ключа нет - это фатальная ошибка
 		_ = m.taskRepo.RegisterError(ctx, task.ID, err)
 		return
 	}
 	
 	if apiKey == nil {
-		// Ключ не найден
 		_ = m.taskRepo.RegisterError(ctx, task.ID, fmt.Errorf("api key not found"))
 		return 
 	}
 
 	if err := m.service.ExecuteRoll(ctx, *apiKey, &task); err != nil {
-		// Логирование уже есть внутри сервиса, здесь просто обработка завершения
-		// Service.handleError уже должен был вызвать RegisterError
+		// Логирование и обработка ошибок внутри сервиса
 	}
 }

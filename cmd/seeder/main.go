@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
+	"os"
 
 	"github.com/romanzzaa/bybit-options-roller/internal/config"
 	"github.com/romanzzaa/bybit-options-roller/internal/domain"
@@ -20,6 +22,8 @@ func main() {
 		log.Fatal("Seeder allowed only in local environment")
 	}
 
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
 	db, err := database.NewConnection(database.Config{
 		Host: cfg.Database.Host, Port: cfg.Database.Port, User: cfg.Database.User,
 		Password: cfg.Database.Password, DBName: cfg.Database.DBName, SSLMode: cfg.Database.SSLMode,
@@ -29,7 +33,7 @@ func main() {
 	}
 	defer db.Close()
 
-	repo := database.NewTaskRepository(db)
+	repo := database.NewTaskRepository(db, logger)
 	
 	// Создание тестовых данных
 	createTestTask(context.Background(), repo)

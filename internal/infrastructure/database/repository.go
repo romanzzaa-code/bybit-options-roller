@@ -3,8 +3,9 @@ package database
 import (
 	"context"
 	"database/sql"
-	"log/slog"
 	"fmt"
+	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/romanzzaa/bybit-options-roller/internal/domain"
@@ -15,40 +16,35 @@ import (
 // --- TaskRepository ---
 
 type TaskRepository struct {
-	db *DB
+	db     *DB
 	logger *slog.Logger
 }
 
-
-func NewTaskRepository(db *DB) *TaskRepository {
+func NewTaskRepository(db *DB, logger *slog.Logger) *TaskRepository {
 	return &TaskRepository{
-		db: db,
+		db:     db,
 		logger: logger,
 	}
 }
 
 func (r *TaskRepository) RegisterError(ctx context.Context, id int64, err error) error {
 	msg := err.Error()
-	
-	// Простая эвристика для классификации ошибок
-	isTransient := strings.Contains(msg, "timeout") || 
-		strings.Contains(msg, "deadline exceeded") || 
+
+	isTransient := strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "deadline exceeded") ||
 		strings.Contains(msg, "502 Bad Gateway") ||
 		strings.Contains(msg, "504 Gateway Timeout")
 
 	var newState domain.TaskState
 	if isTransient {
-		// Оставляем IDLE (или специальный статус RETRY_PENDING), чтобы воркер подхватил снова
-		// Можно добавить инкремент счетчика попыток (retry_count)
-		newState = domain.TaskStateIdle 
-		r.logger.Warn("Transient error registered, scheduling retry", 
-			slog.Int64("task_id", id), 
+		newState = domain.TaskStateIdle
+		r.logger.Warn("Transient error registered, scheduling retry",
+			slog.Int64("task_id", id),
 			slog.String("error", msg))
 	} else {
-		// Фатальная ошибка
 		newState = domain.TaskStateFailed
-		r.logger.Error("Fatal error registered, task failed", 
-			slog.Int64("task_id", id), 
+		r.logger.Error("Fatal error registered, task failed",
+			slog.Int64("task_id", id),
 			slog.String("error", msg))
 	}
 
