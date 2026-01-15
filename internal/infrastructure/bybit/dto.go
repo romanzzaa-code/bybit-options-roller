@@ -46,3 +46,20 @@ type PlaceOrderResponse struct {
 	OrderID     string `json:"orderId"`
 	OrderLinkID string `json:"orderLinkId"`
 }
+
+type InstrumentInfoResponse struct {
+	RetCode int    `json:"retCode"`
+	RetMsg  string `json:"retMsg"`
+	Result  struct {
+		List []struct {
+			Symbol          string `json:"symbol"`
+			Status          string `json:"status"` // "Trading"
+			BaseCoin        string `json:"baseCoin"`
+			QuoteCoin       string `json:"quoteCoin"`
+			OptionType      string `json:"optionType"` // Call/Put
+			StrikePrice     string `json:"strikePrice"`
+			ActivationDate  string `json:"activationDate"`
+			DeliveryTime    string `json:"deliveryTime"`
+		} `json:"list"`
+	} `json:"result"`
+}

@@ -29,6 +29,7 @@ type ExchangeAdapter interface {
 	GetMarkPrice(ctx context.Context, symbol string) (decimal.Decimal, error)
 	GetPosition(ctx context.Context, creds APIKey, symbol string) (Position, error)
 	PlaceOrder(ctx context.Context, creds APIKey, req OrderRequest) (string, error)
+	GetOptionStrikes(ctx context.Context, baseCoin string, expiryDate string) ([]decimal.Decimal, error)
 }
 
 type NotificationService interface {

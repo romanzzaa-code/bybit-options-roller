@@ -80,6 +80,64 @@ func (c *Client) GetMarkPrice(ctx context.Context, symbol string) (decimal.Decim
 	return resp.Result.List[0].MarkPrice, nil
 }
 
+func (c *Client) GetOptionStrikes(ctx context.Context, baseCoin string, expiryDate string) ([]decimal.Decimal, error) {
+	// Endpoint: /v5/market/instruments-info
+	// category=option, baseCoin=ETH (например), limit=1000
+	
+	// В Go HTTP клиенте params передаются через query string
+	url := fmt.Sprintf("%s/v5/market/instruments-info?category=option&baseCoin=%s&status=Trading&limit=1000", c.baseURL, baseCoin)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Публичный эндпоинт, подпись не нужна, но хедеры не помешают
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result InstrumentInfoResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	if result.RetCode != 0 {
+		return nil, fmt.Errorf("bybit api error: %d %s", result.RetCode, result.RetMsg)
+	}
+
+	// Фильтруем и собираем уникальные страйки
+	strikeSet := make(map[string]decimal.Decimal)
+	
+	// Нам нужно найти тикеры, у которых Expiry совпадает с нашей.
+	// Тикеры Bybit: ETH-30JAN24-2000-C.
+	// ExpiryDate мы передаем как "30JAN24".
+	
+	targetSubstr := fmt.Sprintf("-%s-", expiryDate) // "-30JAN24-"
+
+	for _, item := range result.Result.List {
+		if strings.Contains(item.Symbol, targetSubstr) {
+			s, err := decimal.NewFromString(item.StrikePrice)
+			if err == nil {
+				strikeSet[s.String()] = s
+			}
+		}
+	}
+
+	var strikes []decimal.Decimal
+	for _, s := range strikeSet {
+		strikes = append(strikes, s)
+	}
+    
+    if len(strikes) == 0 {
+        return nil, fmt.Errorf("no strikes found for %s %s", baseCoin, expiryDate)
+    }
+
+	return strikes, nil
+}
+
 func (c *Client) GetPosition(ctx context.Context, creds domain.APIKey, symbol string) (domain.Position, error) {
 	params := map[string]string{
 		"category": "option",
