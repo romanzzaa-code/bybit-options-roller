@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/romanzzaa/bybit-options-roller/internal/domain"
+	"github.com/shopspring/decimal"
 )
 
 type RollerService struct {
@@ -158,7 +159,7 @@ func (s *RollerService) processLeg2(ctx context.Context, apiKey domain.APIKey, t
 
 	_, err = s.exchange.PlaceOrder(ctx, apiKey, domain.OrderRequest{
 		Symbol:      nextSym.String(),
-		Side:        targetSide, 
+		Side:        string(targetSide), 
 		OrderType:   domain.OrderTypeMarket,
 		Qty:         task.CurrentQty,
 		OrderLinkID: orderLinkID,

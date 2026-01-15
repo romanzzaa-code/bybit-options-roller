@@ -29,6 +29,10 @@ type DatabaseConfig struct {
 	SSLMode  string
 }
 
+type CryptoConfig struct {
+	EncryptionKey string
+}
+
 func (d *DatabaseConfig) ConnectString() string {
 	return fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
@@ -36,33 +40,42 @@ func (d *DatabaseConfig) ConnectString() string {
 	)
 }
 
-type CryptoConfig struct {
-	EncryptionKey string
-}
-
 func LoadConfig() (*Config, error) {
-	env := getEnv("ENV", "local")
-	testnet := getEnvBool("BYBIT_TESTNET", true)
+    env := getEnv("ENV", "local")
+    testnet := getEnvBool("BYBIT_TESTNET", true)
 
-	dbConfig := DatabaseConfig{
-		Host:     getEnv("DB_HOST", "localhost"),
-		Port:     getEnvInt("DB_PORT", 5432),
-		User:     getEnv("DB_USER", "bybit_roller"),
-		Password: getEnv("DB_PASSWORD", "secret_password"),
-		DBName:   getEnv("DB_NAME", "bybit_roller"),
-		SSLMode:  getEnv("DB_SSLMODE", "disable"),
-	}
+    // --- FIX START ---
+    timeoutStr := getEnv("BYBIT_TIMEOUT_SECONDS", "5")
+    timeoutSec, _ := strconv.Atoi(timeoutStr)
+    if timeoutSec == 0 {
+        timeoutSec = 5
+    }
+    
+    bybitConfig := BybitConfig{
+        Timeout: time.Duration(timeoutSec) * time.Second,
+    }
+    // --- FIX END ---
 
-	cryptoConfig := CryptoConfig{
-		EncryptionKey: getEnv("ENCRYPTION_KEY", ""),
-	}
+    dbConfig := DatabaseConfig{
+        Host:     getEnv("DB_HOST", "localhost"),
+        Port:     getEnvInt("DB_PORT", 5432),
+        User:     getEnv("DB_USER", "bybit_roller"),
+        Password: getEnv("DB_PASSWORD", "secret_password"),
+        DBName:   getEnv("DB_NAME", "bybit_roller"),
+        SSLMode:  getEnv("DB_SSLMODE", "disable"),
+    }
 
-	return &Config{
-		Env:          env,
-		BybitTestnet: testnet,
-		Database:     dbConfig,
-		Crypto:       cryptoConfig,
-	}, nil
+    cryptoConfig := CryptoConfig{
+        EncryptionKey: getEnv("ENCRYPTION_KEY", ""),
+    }
+
+    return &Config{
+        Env:          env,
+        BybitTestnet: testnet,
+        Bybit:        bybitConfig, // Не забудьте добавить это поле!
+        Database:     dbConfig,
+        Crypto:       cryptoConfig,
+    }, nil
 }
 
 func MustLoad() *Config {

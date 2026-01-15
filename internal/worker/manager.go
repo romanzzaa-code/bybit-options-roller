@@ -4,127 +4,155 @@ import (
 	"context"
 	"log/slog"
 	"sync"
-	"time"
 
-	"bybit-options-roller/internal/domain"
-	"bybit-options-roller/internal/usecase"
+	"github.com/romanzzaa/bybit-options-roller/internal/domain"
+	"github.com/romanzzaa/bybit-options-roller/internal/usecase"
+	
+	"github.com/shopspring/decimal"
 )
 
-type Manager struct {
-	repo           domain.TaskRepository
-	keyRepo        domain.APIKeyRepository
-	roller         *usecase.RollerService
-	marketProvider domain.MarketProvider
-	logger         *slog.Logger
-	streamer domain.MarketStreamer // Зависимость от интерфейса!
-    taskChan chan domain.Task      // Внутренняя очередь задач (Buffer)
+// jobDTO связывает задачу и цену, которая её вызвала
+type jobDTO struct {
+	Task  *domain.Task
+	Price decimal.Decimal
+}
 
-	// activeTasks: ключ — UnderlyingSymbol (напр. "ETH"), значение — список задач
-	activeTasks map[string][]*domain.Task
-	mu          sync.RWMutex
+type Manager struct {
+	repo     domain.TaskRepository
+	keyRepo  domain.APIKeyRepository
+	roller   *usecase.RollerService
+	streamer domain.MarketStreamer
+	logger   *slog.Logger
+
+	jobChan chan jobDTO
+	// Кэш для активных задач, чтобы не дергать БД на каждый тик (Опционально для v2)
+	mu sync.RWMutex
 }
 
 func NewManager(
-	tr domain.TaskRepository, 
-	kr domain.APIKeyRepository, // Передаем второй репозиторий
-	roller *usecase.RollerService, 
-	mp domain.MarketProvider, 
+	tr domain.TaskRepository,
+	kr domain.APIKeyRepository,
+	roller *usecase.RollerService,
+	streamer domain.MarketStreamer,
 	logger *slog.Logger,
 ) *Manager {
 	return &Manager{
-		taskRepo:       tr,
-		keyRepo:        kr,
-		roller:         roller,
-		marketProvider: mp,
-		logger:         logger,
-		activeTasks:    make(map[string][]*domain.Task),
+		repo:     tr,
+		keyRepo:  kr,
+		roller:   roller,
+		streamer: streamer,
+		logger:   logger,
+		// Буфер 100, чтобы скачки цены не блокировали WebSocket
+		jobChan: make(chan jobDTO, 100),
 	}
 }
 
-// Start запускает жизненный цикл менеджера
 func (m *Manager) Run(ctx context.Context) {
-    // 1. Подписываемся на поток цен (получаем список активных символов из БД)
-    activeSymbols := m.repo.GetActiveSymbols(ctx)
-    priceUpdates, _ := m.streamer.Subscribe(activeSymbols)
+	m.logger.Info("Starting Manager: Event-Driven Mode")
 
-    // 2. Запускаем Worker Pool (Например, 5 воркеров)
-    for i := 0; i < 5; i++ {
-        go m.worker(ctx)
-    }
-
-    // 3. Dispatcher Loop (Главный цикл)
-    for {
-        select {
-        case event := <-priceUpdates:
-            // ЛОГИКА ДИСПЕТЧЕРА:
-            // Пришла цена по ETH. Ищем задачи, которым интересен ETH.
-            // Это "Hot Path", здесь должно быть быстро.
-            affectedTasks := m.repo.FindTasksByTrigger(ctx, event.Symbol, event.Price)
-            
-            for _, task := range affectedTasks {
-                m.taskChan <- task // Отправляем воркерам
-            }
-            
-        case <-ctx.Done():
-            return
-        }
-    }
-}
-
-// handlePriceUpdate находит все задачи для пришедшего тикера и запускает их проверку
-func (m *Manager) handlePriceUpdate(ctx context.Context, update domain.PriceUpdate) {
-	m.mu.RLock()
-	tasks, ok := m.activeTasks[update.Symbol]
-	m.mu.RUnlock()
-
-	if !ok || len(tasks) == 0 {
+	// 1. Получаем список активных задач для подписки
+	// В продакшене этот список нужно обновлять динамически (Hot Reload)
+	activeTasks, err := m.repo.GetActiveTasks(ctx)
+	if err != nil {
+		m.logger.Error("Failed to get active tasks", "err", err)
 		return
 	}
 
-	for _, task := range tasks {
-		// Здесь мы передаем в RollerService и саму задачу, и актуальную цену из воркера.
-		// Нам нужно сначала получить API ключи пользователя (в реальном коде это через repo)
-		apiKey, err := m.repo.GetAPIKeyByUserID(ctx, task.UserID)
-		if err != nil {
-			m.logger.Error("Failed to get API key for task", "task_id", task.ID, "err", err)
-			continue
-		}
-
-		// Вызываем UseCase
-		if err := m.roller.ExecuteRoll(ctx, apiKey, task, update.Price); err != nil {
-			m.logger.Error("Roll execution failed", "task_id", task.ID, "err", err)
-		}
+	if len(activeTasks) == 0 {
+		m.logger.Warn("No active tasks found. Manager is idle.")
+		// Не выходим, так как могут появиться задачи (нужен механизм обновления подписки)
 	}
-}
 
-// refreshTasks вычитывает активные задачи из БД и обновляет внутренний кэш
-func (m *Manager) refreshTasks(ctx context.Context) error {
-	tasks, err := m.repo.GetActiveTasks(ctx)
+	// Извлекаем уникальные символы для подписки
+	symbolMap := make(map[string]bool)
+	for _, task := range activeTasks {
+		symbolMap[task.UnderlyingSymbol] = true
+	}
+	activeSymbols := make([]string, 0, len(symbolMap))
+	for symbol := range symbolMap {
+		activeSymbols = append(activeSymbols, symbol)
+	}
+
+	// 2. Подписываемся на поток
+	priceUpdates, err := m.streamer.Subscribe(activeSymbols)
 	if err != nil {
-		m.logger.Error("Failed to fetch tasks from DB", "err", err)
-		return err
+		// Критическая ошибка, если не можем даже попытаться подписаться
+		m.logger.Error("CRITICAL: Failed to initialize stream", "err", err)
+		return
 	}
 
-	newMap := make(map[string][]*domain.Task)
-	for _, t := range tasks {
-		newMap[t.UnderlyingSymbol] = append(newMap[t.UnderlyingSymbol], t)
+	// 3. Запускаем пул воркеров (5 шт)
+	for i := 0; i < 5; i++ {
+		go m.worker(ctx, i)
 	}
 
-	m.mu.Lock()
-	m.activeTasks = newMap
-	m.mu.Unlock()
+	// 4. Главный цикл диспетчера (Distributor)
+	m.logger.Info("Manager loop started. Waiting for market events...")
+	for {
+		select {
+		case event, ok := <-priceUpdates:
+			if !ok {
+				m.logger.Error("Market stream channel closed externally. Stopping Manager.")
+				return
+			}
 
-	m.logger.Debug("Task cache refreshed", "active_count", len(tasks))
-	return nil
+			// Логируем для отладки (в проде убрать level debug)
+			// m.logger.Debug("Price Update", "symbol", event.Symbol, "price", event.Price)
+
+			// Ищем задачи, которые сработали (фильтруем в памяти)
+			var affectedTasks []*domain.Task
+			for _, task := range activeTasks {
+				if task.UnderlyingSymbol == event.Symbol && task.ShouldRoll(event.Price) {
+					affectedTasks = append(affectedTasks, &task)
+				}
+			}
+
+			if len(affectedTasks) > 0 {
+				m.logger.Info("Trigger Fired!", "symbol", event.Symbol, "price", event.Price, "count", len(affectedTasks))
+			}
+
+			for _, task := range affectedTasks {
+				// Отправляем в канал без блокировки (если воркеры захлебнулись, лучше пропустить тик, чем положить стрим)
+				select {
+				case m.jobChan <- jobDTO{Task: task, Price: event.Price}:
+				default:
+					m.logger.Warn("Worker pool overloaded! Dropping task execution.", "task_id", task.ID)
+				}
+			}
+
+		case <-ctx.Done():
+			m.logger.Info("Manager stopping...")
+			return
+		}
+	}
 }
 
-func (m *Manager) getUniqueSymbols() []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+// worker исполняет бизнес-логику
+func (m *Manager) worker(ctx context.Context, id int) {
+	m.logger.Debug("Worker started", "worker_id", id)
+	for {
+		select {
+		case job := <-m.jobChan:
+			m.logger.Info("Worker processing task", "worker_id", id, "task_id", job.Task.ID)
 
-	symbols := make([]string, 0, len(m.activeTasks))
-	for s := range m.activeTasks {
-		symbols = append(symbols, s)
+			// Получаем ключи (расшифровка внутри репо)
+			apiKey, err := m.keyRepo.GetByID(ctx, job.Task.APIKeyID)
+			if err != nil {
+				m.logger.Error("Failed to get API key", "task_id", job.Task.ID, "err", err)
+				continue
+			}
+
+			// Запускаем UseCase (Роллирование)
+			// Важно: ExecuteRoll должен быть идемпотентным!
+			err = m.roller.ExecuteRoll(ctx, *apiKey, job.Task, job.Price)
+			if err != nil {
+				m.logger.Error("Roll execution failed", "task_id", job.Task.ID, "err", err)
+			} else {
+				m.logger.Info("Roll executed successfully", "task_id", job.Task.ID)
+			}
+
+		case <-ctx.Done():
+			return
+		}
 	}
-	return symbols
 }

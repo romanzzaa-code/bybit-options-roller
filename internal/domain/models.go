@@ -16,6 +16,12 @@ const (
 	OrderTypeLimit  = "Limit"
 )
 
+// --- Types ---
+
+type Side string
+
+// --- State Machine ---
+
 // --- State Machine ---
 
 type TaskState string
@@ -115,4 +121,12 @@ type PriceUpdate struct {
     Symbol string          // Например, "ETH"
     Price  decimal.Decimal // Индексная цена
     Time   time.Time
+}
+
+// PriceUpdateEvent представляет событие обновления цены для MarketStreamer
+type PriceUpdateEvent struct {
+    Symbol string          // Например, "ETH"
+    Price  decimal.Decimal // Индексная цена
+    Time   time.Time
+    Source string          // Источник данных (например, "bybit-ws")
 }

@@ -6,11 +6,13 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"bybit-options-roller/internal/infrastructure/bybit"
-	"bybit-options-roller/internal/infrastructure/database"
-	"bybit-options-roller/internal/usecase"
-	"bybit-options-roller/internal/worker"
+    "github.com/romanzzaa/bybit-options-roller/internal/infrastructure/bybit"
+    "github.com/romanzzaa/bybit-options-roller/internal/infrastructure/crypto"
+    "github.com/romanzzaa/bybit-options-roller/internal/infrastructure/database"
+    "github.com/romanzzaa/bybit-options-roller/internal/usecase"
+    "github.com/romanzzaa/bybit-options-roller/internal/worker"
 )
 
 func main() {
@@ -18,19 +20,35 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	// 1. Инфраструктура (Драйверы)
-	db, err := database.NewConnection() // Твой метод подключения к БД
+	dbConfig := database.Config{
+		Host:     os.Getenv("DB_HOST"),
+		Port:     5432,
+		User:     os.Getenv("DB_USER"),
+		Password: os.Getenv("DB_PASSWORD"),
+		DBName:   os.Getenv("DB_NAME"),
+		SSLMode:  "disable",
+	}
+
+	db, err := database.NewConnection(dbConfig)
 	if err != nil {
 		panic(err)
 	}
 
 	// 2. Репозитории (Адаптеры)
-	taskRepo := database.NewRepository(db)
-	keyRepo := database.NewAPIKeyRepository(db) // Реализуй его, если еще нет
+	taskRepo := database.NewTaskRepository(db, logger)
+	
+	// Создаем encryptor для API ключей
+	encryptor, err := crypto.NewEncryptor(os.Getenv("ENCRYPTION_KEY"))
+	if err != nil {
+		panic(err)
+	}
+	
+	keyRepo := database.NewAPIKeyRepository(db, encryptor)
 
 	// 3. Доменная логика (Use Cases)
 	// Нам нужен клиент Bybit для исполнения ордеров (REST)
-	bybitClient := bybit.NewClient(os.Getenv("BYBIT_API_KEY"), os.Getenv("BYBIT_API_SECRET"), true)
-	rollerService := usecase.NewRollerService(taskRepo, bybitClient, logger)
+	bybitClient := bybit.NewClient(true, 30*time.Second) // true для тестнета, 30 сек timeout
+	rollerService := usecase.NewRollerService(bybitClient, taskRepo, logger)
 
 	// 4. Рыночные данные (Infrastructure)
 	// Создаем наш новый MarketStream (WebSocket)
@@ -44,7 +62,10 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err := manager.Start(ctx); err != nil {
-		logger.Error("Manager stopped with error", "err", err)
-	}
+	// Запускаем менеджер (Run вместо Start)
+	go manager.Run(ctx)
+
+	// Ждем сигнал остановки
+	<-ctx.Done()
+	logger.Info("Bot stopped gracefully")
 }
