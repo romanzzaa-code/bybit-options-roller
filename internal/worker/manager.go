@@ -2,98 +2,129 @@ package worker
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
-	"github.com/romanzzaa/bybit-options-roller/internal/domain"
+	"bybit-options-roller/internal/domain"
+	"bybit-options-roller/internal/usecase"
 )
 
-type RollerService interface {
-	ExecuteRoll(ctx context.Context, apiKey domain.APIKey, task *domain.Task) error
-}
-
-type APIKeyRepository interface {
-	GetByID(ctx context.Context, id int64) (*domain.APIKey, error)
-}
-
 type Manager struct {
-	service    RollerService
-	taskRepo   domain.TaskRepository
-	apiKeyRepo APIKeyRepository
-	logger     *slog.Logger
-	interval   time.Duration
+	repo           domain.TaskRepository
+	keyRepo        domain.APIKeyRepository
+	roller         *usecase.RollerService
+	marketProvider domain.MarketProvider
+	logger         *slog.Logger
+	streamer domain.MarketStreamer // Зависимость от интерфейса!
+    taskChan chan domain.Task      // Внутренняя очередь задач (Buffer)
+
+	// activeTasks: ключ — UnderlyingSymbol (напр. "ETH"), значение — список задач
+	activeTasks map[string][]*domain.Task
+	mu          sync.RWMutex
 }
 
-func NewManager(svc RollerService, tRepo domain.TaskRepository, kRepo APIKeyRepository, logger *slog.Logger, interval time.Duration) *Manager {
+func NewManager(
+	tr domain.TaskRepository, 
+	kr domain.APIKeyRepository, // Передаем второй репозиторий
+	roller *usecase.RollerService, 
+	mp domain.MarketProvider, 
+	logger *slog.Logger,
+) *Manager {
 	return &Manager{
-		service:    svc,
-		taskRepo:   tRepo,
-		apiKeyRepo: kRepo,
-		logger:     logger,
-		interval:   interval,
+		taskRepo:       tr,
+		keyRepo:        kr,
+		roller:         roller,
+		marketProvider: mp,
+		logger:         logger,
+		activeTasks:    make(map[string][]*domain.Task),
 	}
 }
 
+// Start запускает жизненный цикл менеджера
 func (m *Manager) Run(ctx context.Context) {
-	m.logger.Info("Worker Manager started", slog.Duration("interval", m.interval))
-	
-	ticker := time.NewTicker(m.interval)
-	defer ticker.Stop()
+    // 1. Подписываемся на поток цен (получаем список активных символов из БД)
+    activeSymbols := m.repo.GetActiveSymbols(ctx)
+    priceUpdates, _ := m.streamer.Subscribe(activeSymbols)
 
-	var wg sync.WaitGroup
+    // 2. Запускаем Worker Pool (Например, 5 воркеров)
+    for i := 0; i < 5; i++ {
+        go m.worker(ctx)
+    }
 
-	for {
-		select {
-		case <-ctx.Done():
-			m.logger.Info("Worker Manager stopping, waiting for active rolls to finish...")
-			wg.Wait()
-			m.logger.Info("Worker Manager stopped")
-			return
+    // 3. Dispatcher Loop (Главный цикл)
+    for {
+        select {
+        case event := <-priceUpdates:
+            // ЛОГИКА ДИСПЕТЧЕРА:
+            // Пришла цена по ETH. Ищем задачи, которым интересен ETH.
+            // Это "Hot Path", здесь должно быть быстро.
+            affectedTasks := m.repo.FindTasksByTrigger(ctx, event.Symbol, event.Price)
+            
+            for _, task := range affectedTasks {
+                m.taskChan <- task // Отправляем воркерам
+            }
+            
+        case <-ctx.Done():
+            return
+        }
+    }
+}
 
-		case <-ticker.C:
-			m.processBatch(ctx, &wg)
+// handlePriceUpdate находит все задачи для пришедшего тикера и запускает их проверку
+func (m *Manager) handlePriceUpdate(ctx context.Context, update domain.PriceUpdate) {
+	m.mu.RLock()
+	tasks, ok := m.activeTasks[update.Symbol]
+	m.mu.RUnlock()
+
+	if !ok || len(tasks) == 0 {
+		return
+	}
+
+	for _, task := range tasks {
+		// Здесь мы передаем в RollerService и саму задачу, и актуальную цену из воркера.
+		// Нам нужно сначала получить API ключи пользователя (в реальном коде это через repo)
+		apiKey, err := m.repo.GetAPIKeyByUserID(ctx, task.UserID)
+		if err != nil {
+			m.logger.Error("Failed to get API key for task", "task_id", task.ID, "err", err)
+			continue
+		}
+
+		// Вызываем UseCase
+		if err := m.roller.ExecuteRoll(ctx, apiKey, task, update.Price); err != nil {
+			m.logger.Error("Roll execution failed", "task_id", task.ID, "err", err)
 		}
 	}
 }
 
-func (m *Manager) processBatch(ctx context.Context, wg *sync.WaitGroup) {
-	tasks, err := m.taskRepo.GetActiveTasks(ctx)
+// refreshTasks вычитывает активные задачи из БД и обновляет внутренний кэш
+func (m *Manager) refreshTasks(ctx context.Context) error {
+	tasks, err := m.repo.GetActiveTasks(ctx)
 	if err != nil {
-		m.logger.Error("Failed to fetch active tasks", slog.String("error", err.Error()))
-		return
+		m.logger.Error("Failed to fetch tasks from DB", "err", err)
+		return err
 	}
 
-	if len(tasks) == 0 {
-		return
+	newMap := make(map[string][]*domain.Task)
+	for _, t := range tasks {
+		newMap[t.UnderlyingSymbol] = append(newMap[t.UnderlyingSymbol], t)
 	}
 
-	m.logger.Debug("Processing tasks", slog.Int("count", len(tasks)))
+	m.mu.Lock()
+	m.activeTasks = newMap
+	m.mu.Unlock()
 
-	for _, task := range tasks {
-		wg.Add(1)
-		go func(t domain.Task) {
-			defer wg.Done()
-			m.executeTask(ctx, t)
-		}(task)
-	}
+	m.logger.Debug("Task cache refreshed", "active_count", len(tasks))
+	return nil
 }
 
-func (m *Manager) executeTask(ctx context.Context, task domain.Task) {
-	apiKey, err := m.apiKeyRepo.GetByID(ctx, task.APIKeyID)
-	if err != nil {
-		m.logger.Error("Failed to get API key", slog.Int64("task_id", task.ID), slog.String("error", err.Error()))
-		_ = m.taskRepo.RegisterError(ctx, task.ID, err)
-		return
-	}
-	
-	if apiKey == nil {
-		_ = m.taskRepo.RegisterError(ctx, task.ID, fmt.Errorf("api key not found"))
-		return 
-	}
+func (m *Manager) getUniqueSymbols() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	if err := m.service.ExecuteRoll(ctx, *apiKey, &task); err != nil {
-		// Логирование и обработка ошибок внутри сервиса
+	symbols := make([]string, 0, len(m.activeTasks))
+	for s := range m.activeTasks {
+		symbols = append(symbols, s)
 	}
+	return symbols
 }

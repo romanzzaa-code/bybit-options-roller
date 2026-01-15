@@ -22,54 +22,33 @@ func NewRollerService(exchange domain.ExchangeAdapter, taskRepo domain.TaskRepos
 	}
 }
 
-// ExecuteRoll выполняет процесс роллирования с поддержкой восстановления после сбоев.
-func (s *RollerService) ExecuteRoll(ctx context.Context, apiKey domain.APIKey, task *domain.Task) error {
+func (s *RollerService) ExecuteRoll(ctx context.Context, apiKey domain.APIKey, task *domain.Task, currentPrice decimal.Decimal) error {
 	log := s.logger.With(
 		slog.Int64("task_id", task.ID),
 		slog.String("symbol", task.UnderlyingSymbol),
 	)
 
-	// ---------------------------------------------------------
-	// 1. ЛОГИКА ВОССТАНОВЛЕНИЯ (CRASH RECOVERY)
-	// ---------------------------------------------------------
-	// Если мы упали после закрытия первой ноги, мы ОБЯЗАНЫ завершить сделку,
-	// игнорируя текущую цену, триггеры и состояние рынка.
+	// 1. RECOVERY MODE (не требует проверки цены)
 	if task.Status == domain.TaskStateLeg1Closed {
-		log.Warn("⚠️ RECOVERY MODE: Task found in LEG1_CLOSED. Resuming immediately to prevent naked position.")
-		
-		// В режиме восстановления мы не можем запросить позицию с биржи (она уже закрыта).
-		// Мы доверяем task.CurrentQty, сохраненному в БД.
+		log.Warn("⚠️ RECOVERY MODE: Resuming to prevent naked position.")
 		return s.processLeg2(ctx, apiKey, task, log)
 	}
 
-	// ---------------------------------------------------------
-	// 2. СТАНДАРТНАЯ ЛОГИКА (TRIGGER CHECK)
-	// ---------------------------------------------------------
-	
-	// Получаем цену индекса
-	indexTicker := domain.Symbol(task.UnderlyingSymbol).GetIndexTicker()
-	price, err := s.exchange.GetIndexPrice(ctx, indexTicker)
-	if err != nil {
-		return fmt.Errorf("failed to get index price: %w", err)
-	}
-
-	// Проверяем условия триггера
-	// (ShouldRoll должен проверять статус IDLE внутри или мы проверяем здесь, 
-	// но так как мы уже обработали LEG1_CLOSED выше, здесь мы работаем с чистой совестью)
-	if !task.ShouldRoll(price) {
+	// 2. TRIGGER CHECK (на основе ПЕРЕДАННОЙ цены)
+	// Больше никакого s.exchange.GetIndexPrice() здесь!
+	if !task.ShouldRoll(currentPrice) {
 		return nil
 	}
 
-	log.Info("🚀 Trigger hit, initiating roll sequence", 
-		slog.String("price", price.String()), 
+	log.Info("🚀 Trigger hit", 
+		slog.String("price", currentPrice.String()), 
 		slog.String("trigger", task.TriggerPrice.String()))
 
-	// Блокируем задачу (Оптимистичная блокировка)
+	// 3. Блокировка и выполнение (Optimistic Locking)
 	if err := s.taskRepo.UpdateTaskState(ctx, task.ID, domain.TaskStateRollInitiated, task.Version); err != nil {
-		log.Warn("Concurrent update detected, skipping", slog.String("err", err.Error()))
-		return nil
+		return nil // Кто-то другой уже начал ролл
 	}
-	task.Version++ // Обновляем локальную версию после успешной записи в БД
+	task.Version++
 
 	// ---------------------------------------------------------
 	// 3. ВЫПОЛНЕНИЕ LEG 1 (CLOSE OLD POSITION)
@@ -173,7 +152,7 @@ func (s *RollerService) processLeg2(ctx context.Context, apiKey domain.APIKey, t
 	// Тут нужна бизнес-логика определения Side. Допустим, стратегия "Short Put" -> мы всегда Sell.
 	// Если стратегия динамическая, нам нужно знать Side изначальной позиции.
 	// В рамках этого фикса допустим, мы роллим ту же сторону.
-	targetSide := domain.SideSell // Default для шорт-бота, или нужно хранить Side в Task
+	targetSide := task.TargetSide
 	
 	orderLinkID := fmt.Sprintf("open-%d-v%d", task.ID, task.Version)
 

@@ -13,6 +13,41 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+func (r *APIKeyRepository) GetActiveByUserID(ctx context.Context, userID int64) (*domain.APIKey, error) {
+	query := `
+		SELECT id, user_id, key_enc, secret_enc, label, is_valid, created_at
+		FROM api_keys
+		WHERE user_id = $1 AND is_valid = TRUE
+		ORDER BY created_at DESC
+		LIMIT 1
+	`
+
+	row := r.db.QueryRowContext(ctx, query, userID)
+	ak := &domain.APIKey{}
+	var keyEnc, secretEnc string
+
+	err := row.Scan(&ak.ID, &ak.UserID, &keyEnc, &secretEnc, &ak.Label, &ak.IsValid, &ak.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db scan error: %w", err)
+	}
+
+	// КРИТИЧНО: Обработка ошибок дешифрования
+	ak.Key, err = r.encryptor.Decrypt(keyEnc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt API Key for user %d: %w", userID, err)
+	}
+
+	ak.Secret, err = r.encryptor.Decrypt(secretEnc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt API Secret for user %d: %w", userID, err)
+	}
+
+	return ak, nil
+}
+
 // --- TaskRepository ---
 
 type TaskRepository struct {
@@ -23,7 +58,7 @@ type TaskRepository struct {
 func NewTaskRepository(db *DB, logger *slog.Logger) *TaskRepository {
 	return &TaskRepository{
 		db:     db,
-		logger: logger,
+		logger: logger, // Теперь передается явно
 	}
 }
 

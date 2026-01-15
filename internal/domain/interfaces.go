@@ -41,3 +41,16 @@ type UserRepository interface {
 	UpdateSubscription(ctx context.Context, telegramID int64, expiresAt time.Time) error
 	IsActive(ctx context.Context, telegramID int64) (bool, error)
 }
+
+type MarketProvider interface {
+    // Subscribe запрашивает поток данных для списка символов
+    Subscribe(symbols []string) (<-chan PriceUpdate, error)
+    // Close закрывает все соединения
+    Close() error
+}
+
+// MarketStreamer определяет поток данных (Dependency Inversion)
+type MarketStreamer interface {
+    // Subscribe возвращает канал, в который будут лететь цены
+    Subscribe(symbols []string) (<-chan PriceUpdateEvent, error)
+}

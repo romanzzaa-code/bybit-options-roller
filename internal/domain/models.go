@@ -35,6 +35,7 @@ type Task struct {
 	ID                  int64
 	UserID              int64
 	APIKeyID            int64
+	TargetSide   		Side
 	CurrentOptionSymbol string
 	UnderlyingSymbol    string
 	CurrentQty          decimal.Decimal
@@ -107,4 +108,11 @@ type OrderRequest struct {
 	Price       decimal.Decimal
 	ReduceOnly  bool
 	OrderLinkID string
+}
+
+// PriceUpdate представляет собой актуальную цену для конкретного базового актива
+type PriceUpdate struct {
+    Symbol string          // Например, "ETH"
+    Price  decimal.Decimal // Индексная цена
+    Time   time.Time
 }
