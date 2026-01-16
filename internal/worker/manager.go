@@ -135,11 +135,7 @@ func (m *Manager) Run(ctx context.Context) {
 			m.mu.RUnlock()
 
 			for _, task := range affectedTasks {
-				select {
-				case m.jobChan <- jobDTO{Task: task, Price: event.Price}:
-				default:
-					m.logger.Warn("Worker pool overloaded", "task_id", task.ID)
-				}
+				m.jobChan <- jobDTO{Task: task, Price: event.Price}
 			}
 
 		case <-ctx.Done():
@@ -149,6 +145,15 @@ func (m *Manager) Run(ctx context.Context) {
 }
 
 func (m *Manager) worker(ctx context.Context, id int) {
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.Error("Worker panicked! Restarting...", 
+				slog.Int("worker_id", id), 
+				slog.Any("panic", r))
+			// Перезапускаем воркера, чтобы пул не истощился
+			go m.worker(ctx, id)
+		}
+	}()
 	for {
 		select {
 		case job := <-m.jobChan:

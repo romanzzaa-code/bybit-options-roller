@@ -212,6 +212,9 @@ func (c *Client) PlaceOrder(ctx context.Context, creds domain.APIKey, req domain
 	if req.ReduceOnly {
 		bodyParams["reduceOnly"] = true
 	}
+	if req.TimeInForce != "" {
+		bodyParams["timeInForce"] = req.TimeInForce
+	}
 
 	var resp BaseResponse[PlaceOrderResponse]
 	if err := c.sendPrivateRequest(ctx, creds, "POST", "/v5/order/create", nil, bodyParams, &resp); err != nil {

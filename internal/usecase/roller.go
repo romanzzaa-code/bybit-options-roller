@@ -76,6 +76,10 @@ func (s *RollerService) ExecuteRoll(ctx context.Context, apiKey domain.APIKey, t
 
 // processLeg1: Получает текущую позицию, закрывает её и обновляет статус в БД.
 func (s *RollerService) processLeg1(ctx context.Context, apiKey domain.APIKey, task *domain.Task, log *slog.Logger) error {
+	if task.TargetSide == "" {
+		s.logger.Warn("TargetSide is empty in Leg 2 (likely after restart), defaulting to SELL")
+		task.TargetSide = domain.SideSell
+	}
 	// --- НАЧАЛО: Проверка экспирации ---
 	// Пытаемся понять, жив ли еще опцион
 	expiryTime, err := domain.ParseExpirationFromSymbol(task.CurrentOptionSymbol) // <--- Правильное поле
@@ -114,27 +118,38 @@ func (s *RollerService) processLeg1(ctx context.Context, apiKey domain.APIKey, t
 		return s.taskRepo.UpdateTaskState(ctx, task.ID, domain.TaskStateCompleted, task.Version)
 	}
 
-	// Обновляем qty в задаче, чтобы Leg 2 знал, сколько открывать
-	task.CurrentQty = position.Qty
-
-	// 2. Формируем ордер на закрытие
+	markPrice, err := s.exchange.GetMarkPrice(ctx, task.CurrentOptionSymbol)
+	if err != nil {
+		return fmt.Errorf("failed to get mark price for leg1: %w", err)
+	}
 	closeSide := domain.SideBuy
 	if position.Side == domain.SideBuy {
 		closeSide = domain.SideSell
 	}
+	if task.TargetSide == "" {
+		task.TargetSide = domain.Side(position.Side) 
+	}
 
-	// Идемпотентный ID
-	orderLinkID := fmt.Sprintf("close-%d-v%d", task.ID, task.Version)
+	// Рассчитываем агрессивную цену
+	safePrice := s.calculateSafeLimitPrice(string(closeSide), markPrice)
 
-	log.Info("Executing Leg 1 (Close)", 
+	log.Info("Executing Leg 1 (Close) with Aggressive Limit", 
 		slog.String("symbol", task.CurrentOptionSymbol),
 		slog.String("qty", position.Qty.String()),
-		slog.String("side", string(closeSide)))
+		slog.String("side", string(closeSide)),
+		slog.String("mark_price", markPrice.String()),
+		slog.String("limit_price", safePrice.String()))
+
+	// 2. Формируем ордер на закрытие (Aggressive Limit IOC)
+	// Идемпотентный ID
+	orderLinkID := fmt.Sprintf("close-%d-v%d", task.ID, task.Version)
 
 	_, err = s.exchange.PlaceOrder(ctx, apiKey, domain.OrderRequest{
 		Symbol:      task.CurrentOptionSymbol,
 		Side:        closeSide,
-		OrderType:   domain.OrderTypeMarket,
+		OrderType:   domain.OrderTypeLimit, // <--- ИЗМЕНЕНО
+		Price:       safePrice,             // <--- НОВОЕ
+		TimeInForce: "IOC",                 // <--- НОВОЕ (Immediate Or Cancel)
 		Qty:         position.Qty,
 		ReduceOnly:  true,
 		OrderLinkID: orderLinkID,
@@ -180,14 +195,32 @@ func (s *RollerService) processLeg2(ctx context.Context, apiKey domain.APIKey, t
 		slog.String("old_symbol", task.CurrentOptionSymbol),
 		slog.String("new_symbol", nextSymbolStr),
 		slog.String("qty", task.CurrentQty.String()))
+	
+	nextMarkPrice, err := s.exchange.GetMarkPrice(ctx, nextSymbolStr)
+	if err != nil {
+		return fmt.Errorf("failed to get mark price for leg2 (%s): %w", nextSymbolStr, err)
+	}
 
-	// 4. Открываем новую позицию
+	// Рассчитываем агрессивную цену для открытия
+	safeOpenPrice := s.calculateSafeLimitPrice(string(task.TargetSide), nextMarkPrice)
+
+	log.Info("Executing Leg 2 (Open) with Aggressive Limit",
+		slog.String("method", "SmartStrikeSelection"),
+		slog.String("old_symbol", task.CurrentOptionSymbol),
+		slog.String("new_symbol", nextSymbolStr),
+		slog.String("mark_price", nextMarkPrice.String()),
+		slog.String("limit_price", safeOpenPrice.String()),
+		slog.String("qty", task.CurrentQty.String()))
+
+	// 4. Открываем новую позицию (Aggressive Limit IOC)
 	orderLinkID := fmt.Sprintf("open-%d-v%d", task.ID, task.Version)
 
 	_, err = s.exchange.PlaceOrder(ctx, apiKey, domain.OrderRequest{
 		Symbol:      nextSymbolStr,
 		Side:        string(task.TargetSide),
-		OrderType:   domain.OrderTypeMarket,
+		OrderType:   domain.OrderTypeLimit, // <--- ИЗМЕНЕНО
+		Price:       safeOpenPrice,         // <--- НОВОЕ
+		TimeInForce: "IOC",                 // <--- НОВОЕ
 		Qty:         task.CurrentQty,
 		OrderLinkID: orderLinkID,
 	})
@@ -200,10 +233,61 @@ func (s *RollerService) processLeg2(ctx context.Context, apiKey domain.APIKey, t
 		log.Error("Failed to update task final state", slog.String("err", err.Error()))
 		return nil
 	}
+	retryCount := 0
+	for {
+		// Проверяем, не выключается ли бот (Graceful Shutdown)
+		if ctx.Err() != nil {
+			log.Warn("Context cancelled during Leg 2 retry loop. Task remains in LEG1_CLOSED state.")
+			return ctx.Err()
+		}
 
+		err := s.processLeg2(ctx, apiKey, task, log)
+		if err == nil {
+			// УСПЕХ! Выходим из цикла.
+			break
+		}
+
+		retryCount++
+		// Логируем ошибку, но НЕ меняем статус на FAILED.
+		// Мы будем долбить биржу до победного.
+		log.Error("⚠️ Leg 2 failed, retrying...",
+			slog.Int("attempt", retryCount),
+			slog.String("err", err.Error()))
+
+		// Ждем перед повтором (Backoff strategy)
+		// Можно сделать экспоненциальную задержку, но для начала хватит фиксированной.
+		// Важно использовать select с ctx.Done, чтобы не зависнуть при выключении.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+			// Продолжаем цикл
+		}
+	}
+
+	log.Info("🎉 Roll sequence completed successfully")
 	return nil
+
 }
 
 func (s *RollerService) handleError(ctx context.Context, task *domain.Task, err error) {
 	_ = s.taskRepo.RegisterError(ctx, task.ID, err)
+}
+
+// calculateSafeLimitPrice рассчитывает цену для Агрессивной Лимитки.
+// Если мы ПОКУПАЕМ (Close Short / Open Long), мы готовы купить дороже (MarkPrice + 20%).
+// Если мы ПРОДАЕМ (Open Short / Close Long), мы готовы продать дешевле (MarkPrice - 20%).
+func (s *RollerService) calculateSafeLimitPrice(side string, markPrice decimal.Decimal) decimal.Decimal {
+	// 20% "запаса" для гарантии исполнения
+	slippageFactor := decimal.NewFromFloat(0.20) 
+
+	if side == domain.SideBuy {
+		// Хотим купить: ставим лимитку ВЫШЕ рынка (Mark * 1.2)
+		// Ордер исполнится мгновенно по лучшим ценам стакана, но не дороже этого потолка.
+		return markPrice.Mul(decimal.NewFromInt(1).Add(slippageFactor))
+	}
+
+	// Хотим продать: ставим лимитку НИЖЕ рынка (Mark * 0.8)
+	// Ордер исполнится мгновенно, но не дешевле этого пола.
+	return markPrice.Mul(decimal.NewFromInt(1).Sub(slippageFactor))
 }

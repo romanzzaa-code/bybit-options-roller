@@ -114,6 +114,7 @@ type OrderRequest struct {
 	Price       decimal.Decimal
 	ReduceOnly  bool
 	OrderLinkID string
+	TimeInForce string
 }
 
 // PriceUpdate представляет собой актуальную цену для конкретного базового актива
