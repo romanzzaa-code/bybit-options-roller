@@ -72,7 +72,7 @@ func main() {
 	tgBot.Debug = false
 	logger.Info("Telegram bot authorized", slog.String("username", tgBot.Self.UserName))
 
-	botHandler := bot.NewHandler(tgBot, userRepo, keyRepo, taskRepo, licRepo, bybitClient, cfg.Telegram.AdminID, logger)
+	botHandler := bot.NewHandler(tgBot, userRepo, keyRepo, taskRepo, licRepo, manager, bybitClient, cfg.Telegram.AdminID, logger)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

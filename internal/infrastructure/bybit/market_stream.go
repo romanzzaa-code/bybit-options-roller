@@ -51,6 +51,7 @@ func (s *MarketStream) Subscribe(symbols []string) (<-chan domain.PriceUpdateEve
 	return out, nil
 }
 
+
 // maintainConnection - главный цикл жизнеобеспечения (Reconnect Loop)
 func (s *MarketStream) maintainConnection(symbols []string, out chan<- domain.PriceUpdateEvent) {
 	for {
@@ -200,4 +201,18 @@ type WsTickerEvent struct {
 		LastPrice decimal.Decimal `json:"lastPrice"`
 		MarkPrice decimal.Decimal `json:"markPrice"`
 	} `json:"data"`
+	
+}
+
+func (s *MarketStream) AddSubscriptions(symbols []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		// Если соединения еще нет, просто выходим.
+		return nil
+	}
+
+	// Отправляем команду subscribe в существующий сокет
+	return s.sendSubscribe(symbols)
 }

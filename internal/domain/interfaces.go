@@ -61,4 +61,5 @@ type MarketProvider interface {
 
 type MarketStreamer interface {
     Subscribe(symbols []string) (<-chan PriceUpdateEvent, error)
+	AddSubscriptions(symbols []string) error
 }

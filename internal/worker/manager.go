@@ -11,7 +11,6 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// jobDTO связывает задачу и цену, которая её вызвала
 type jobDTO struct {
 	Task  *domain.Task
 	Price decimal.Decimal
@@ -25,8 +24,10 @@ type Manager struct {
 	logger   *slog.Logger
 
 	jobChan chan jobDTO
-	// Кэш для активных задач, чтобы не дергать БД на каждый тик (Опционально для v2)
-	mu sync.RWMutex
+	
+	// --- Hot Reload State ---
+	activeTasks []domain.Task // Кэш задач в памяти
+	mu          sync.RWMutex  // Замок для защиты activeTasks от гонки данных
 }
 
 func NewManager(
@@ -42,115 +43,120 @@ func NewManager(
 		roller:   roller,
 		streamer: streamer,
 		logger:   logger,
-		// Буфер 100, чтобы скачки цены не блокировали WebSocket
-		jobChan: make(chan jobDTO, 100),
+		jobChan:  make(chan jobDTO, 100),
 	}
+}
+
+// ReloadTasks вызывает Handler, когда пользователь добавил задачу
+func (m *Manager) ReloadTasks(ctx context.Context) error {
+	m.logger.Info("🔄 Hot Reloading tasks...")
+
+	// 1. Идем в базу за свежим списком
+	newTasks, err := m.repo.GetActiveTasks(ctx)
+	if err != nil {
+		return err
+	}
+
+	// 2. Обновляем кэш под замком (Thread-Safe)
+	m.mu.Lock()
+	m.activeTasks = newTasks
+	m.mu.Unlock()
+
+	// 3. Собираем символы для подписки
+	symbolMap := make(map[string]bool)
+	for _, task := range newTasks {
+		symbolMap[task.UnderlyingSymbol] = true
+	}
+	var symbols []string
+	for sym := range symbolMap {
+		symbols = append(symbols, sym)
+	}
+
+	// 4. Динамически подписываемся на WebSocket
+	// Внимание: Этот метод требует обновления в интерфейсе MarketStreamer (см. Шаг 2 и 3)
+	if len(symbols) > 0 {
+		if err := m.streamer.AddSubscriptions(symbols); err != nil {
+			m.logger.Error("Failed to add subscriptions", "err", err)
+			return err
+		}
+	}
+	
+	m.logger.Info("✅ Tasks reloaded", "count", len(newTasks))
+	return nil
 }
 
 func (m *Manager) Run(ctx context.Context) {
 	m.logger.Info("Starting Manager: Event-Driven Mode")
 
-	// 1. Получаем список активных задач для подписки
-	// В продакшене этот список нужно обновлять динамически (Hot Reload)
-	activeTasks, err := m.repo.GetActiveTasks(ctx)
+	// Первичная загрузка
+	if err := m.ReloadTasks(ctx); err != nil {
+		m.logger.Error("Initial task load failed", "err", err)
+	}
+
+	// Подписка (даже если список пуст, запускаем слушателя)
+	m.mu.RLock()
+	initialSymbols := make([]string, 0)
+	for _, t := range m.activeTasks {
+		initialSymbols = append(initialSymbols, t.UnderlyingSymbol)
+	}
+	m.mu.RUnlock()
+
+	priceUpdates, err := m.streamer.Subscribe(initialSymbols)
 	if err != nil {
-		m.logger.Error("Failed to get active tasks", "err", err)
-		return
-	}
-
-	if len(activeTasks) == 0 {
-		m.logger.Warn("No active tasks found. Manager is idle.")
-		// Не выходим, так как могут появиться задачи (нужен механизм обновления подписки)
-	}
-
-	// Извлекаем уникальные символы для подписки
-	symbolMap := make(map[string]bool)
-	for _, task := range activeTasks {
-		symbolMap[task.UnderlyingSymbol] = true
-	}
-	activeSymbols := make([]string, 0, len(symbolMap))
-	for symbol := range symbolMap {
-		activeSymbols = append(activeSymbols, symbol)
-	}
-
-	// 2. Подписываемся на поток
-	priceUpdates, err := m.streamer.Subscribe(activeSymbols)
-	if err != nil {
-		// Критическая ошибка, если не можем даже попытаться подписаться
 		m.logger.Error("CRITICAL: Failed to initialize stream", "err", err)
 		return
 	}
 
-	// 3. Запускаем пул воркеров (5 шт)
+	// Воркеры
 	for i := 0; i < 5; i++ {
 		go m.worker(ctx, i)
 	}
 
-	// 4. Главный цикл диспетчера (Distributor)
-	m.logger.Info("Manager loop started. Waiting for market events...")
+	// Loop
+	m.logger.Info("Manager loop started.")
 	for {
 		select {
 		case event, ok := <-priceUpdates:
 			if !ok {
-				m.logger.Error("Market stream channel closed externally. Stopping Manager.")
 				return
 			}
 
-			// Логируем для отладки (в проде убрать level debug)
-			// m.logger.Debug("Price Update", "symbol", event.Symbol, "price", event.Price)
-
-			// Ищем задачи, которые сработали (фильтруем в памяти)
+			// Читаем задачи под R-замком (параллельное чтение разрешено)
+			m.mu.RLock()
 			var affectedTasks []*domain.Task
-			for _, task := range activeTasks {
+			// Важно: activeTasks теперь актуален всегда
+			for i := range m.activeTasks {
+				// Берем указатель на задачу в слайсе, чтобы не копировать
+				task := &m.activeTasks[i] 
 				if task.UnderlyingSymbol == event.Symbol && task.ShouldRoll(event.Price) {
-					affectedTasks = append(affectedTasks, &task)
+					affectedTasks = append(affectedTasks, task)
 				}
 			}
-
-			if len(affectedTasks) > 0 {
-				m.logger.Info("Trigger Fired!", "symbol", event.Symbol, "price", event.Price, "count", len(affectedTasks))
-			}
+			m.mu.RUnlock()
 
 			for _, task := range affectedTasks {
-				// Отправляем в канал без блокировки (если воркеры захлебнулись, лучше пропустить тик, чем положить стрим)
 				select {
 				case m.jobChan <- jobDTO{Task: task, Price: event.Price}:
 				default:
-					m.logger.Warn("Worker pool overloaded! Dropping task execution.", "task_id", task.ID)
+					m.logger.Warn("Worker pool overloaded", "task_id", task.ID)
 				}
 			}
 
 		case <-ctx.Done():
-			m.logger.Info("Manager stopping...")
 			return
 		}
 	}
 }
 
-// worker исполняет бизнес-логику
 func (m *Manager) worker(ctx context.Context, id int) {
-	m.logger.Debug("Worker started", "worker_id", id)
 	for {
 		select {
 		case job := <-m.jobChan:
-			m.logger.Info("Worker processing task", "worker_id", id, "task_id", job.Task.ID)
-
-			// Получаем ключи (расшифровка внутри репо)
 			apiKey, err := m.keyRepo.GetByID(ctx, job.Task.APIKeyID)
 			if err != nil {
-				m.logger.Error("Failed to get API key", "task_id", job.Task.ID, "err", err)
 				continue
 			}
-
-			// Запускаем UseCase (Роллирование)
-			// Важно: ExecuteRoll должен быть идемпотентным!
-			err = m.roller.ExecuteRoll(ctx, *apiKey, job.Task, job.Price)
-			if err != nil {
-				m.logger.Error("Roll execution failed", "task_id", job.Task.ID, "err", err)
-			} else {
-				m.logger.Info("Roll executed successfully", "task_id", job.Task.ID)
-			}
-
+			_ = m.roller.ExecuteRoll(ctx, *apiKey, job.Task, job.Price)
 		case <-ctx.Done():
 			return
 		}
