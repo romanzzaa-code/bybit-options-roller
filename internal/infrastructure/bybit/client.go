@@ -164,6 +164,38 @@ func (c *Client) GetPosition(ctx context.Context, creds domain.APIKey, symbol st
 	}, nil
 }
 
+// 2. НОВЫЙ МЕТОД (который мы добавили)
+func (c *Client) GetPositions(ctx context.Context, creds domain.APIKey) ([]domain.Position, error) {
+    // Для Option category symbol не обязателен, вернет все опционы
+    params := map[string]string{
+        "category": "option", 
+    }
+
+    var resp BaseResponse[PositionResponse]
+    if err := c.sendPrivateRequest(ctx, creds, "GET", "/v5/position/list", params, nil, &resp); err != nil {
+        return nil, err
+    }
+
+    var positions []domain.Position
+    for _, raw := range resp.Result.List {
+        // Фильтруем пустые позиции (где size = 0)
+        if raw.Size.IsZero() {
+            continue
+        }
+        
+        positions = append(positions, domain.Position{
+            Symbol:        raw.Symbol,
+            Side:          raw.Side,
+            Qty:           raw.Size,
+            EntryPrice:    raw.AvgPrice,
+            MarkPrice:     raw.MarkPrice,
+            UnrealizedPnL: raw.UnrealisedPnl,
+        })
+    }
+
+    return positions, nil
+}
+
 func (c *Client) PlaceOrder(ctx context.Context, creds domain.APIKey, req domain.OrderRequest) (string, error) {
 	bodyParams := map[string]interface{}{
 		"category":    "option",

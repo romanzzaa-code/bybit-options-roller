@@ -16,18 +16,29 @@ type TaskRepository interface {
 	UpdateTaskSymbol(ctx context.Context, id int64, newSymbol string, newQty decimal.Decimal, version int64) error
 	
 	SaveError(ctx context.Context, id int64, errMessage string) error
-	// RegisterError добавлен, так как используется в manager.go и roller.go
 	RegisterError(ctx context.Context, id int64, err error) error
 }
 
 type APIKeyRepository interface {
-	GetByID(ctx context.Context, id int64) (*APIKey, error)
+    // БЫЛО: Только GetByID
+    GetByID(ctx context.Context, id int64) (*APIKey, error)
+    
+    // ДОБАВЛЯЕМ (эти методы используются в боте):
+    Create(ctx context.Context, apiKey *APIKey) error
+    GetActiveByUserID(ctx context.Context, userID int64) (*APIKey, error)
+}
+
+// ДОБАВЛЯЕМ НОВЫЙ ИНТЕРФЕЙС (его не было, а бот его использует)
+type LicenseRepository interface {
+    Generate(ctx context.Context, durationDays int) (*LicenseKey, error)
+    Redeem(ctx context.Context, code string, userID int64) error
 }
 
 type ExchangeAdapter interface {
 	GetIndexPrice(ctx context.Context, symbol string) (decimal.Decimal, error)
 	GetMarkPrice(ctx context.Context, symbol string) (decimal.Decimal, error)
 	GetPosition(ctx context.Context, creds APIKey, symbol string) (Position, error)
+	GetPositions(ctx context.Context, creds APIKey) ([]Position, error) // <--- Убедитесь, что этот тоже тут
 	PlaceOrder(ctx context.Context, creds APIKey, req OrderRequest) (string, error)
 	GetOptionStrikes(ctx context.Context, baseCoin string, expiryDate string) ([]decimal.Decimal, error)
 }
@@ -44,14 +55,10 @@ type UserRepository interface {
 }
 
 type MarketProvider interface {
-    // Subscribe запрашивает поток данных для списка символов
     Subscribe(symbols []string) (<-chan PriceUpdate, error)
-    // Close закрывает все соединения
     Close() error
 }
 
-// MarketStreamer определяет поток данных (Dependency Inversion)
 type MarketStreamer interface {
-    // Subscribe возвращает канал, в который будут лететь цены
     Subscribe(symbols []string) (<-chan PriceUpdateEvent, error)
 }
