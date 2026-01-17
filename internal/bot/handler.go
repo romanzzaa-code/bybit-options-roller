@@ -335,14 +335,54 @@ func (h *Handler) showMainMenu(ctx context.Context, chatID int64, telegramID int
 // но нужно убедиться, что они проверяют подписку.
 
 func (h *Handler) cmdStatus(ctx context.Context, msg *tgbotapi.Message) {
-	if !h.checkSubscription(ctx, msg) { return }
-	
-	// ... (старая логика cmdStatus)
-	// Для краткости я не дублирую весь код, он есть в предыдущем файле.
-	// Просто скопируйте тело функции cmdStatus из старого файла, оно нормальное.
-	
-	// ВАЖНО: Вставь сюда логику cmdStatus из старого файла
-	h.send(msg.Chat.ID, "Статус задач: (Логика из старого файла)")
+	if !h.checkSubscription(ctx, msg) {
+		return
+	}
+
+	user, err := h.userRepo.GetByTelegramID(ctx, msg.From.ID)
+	if err != nil {
+		h.send(msg.Chat.ID, "Ошибка получения профиля.")
+		return
+	}
+
+	// Получаем задачи пользователя
+	tasks, err := h.taskRepo.GetActiveTasksByUserID(ctx, user.ID)
+	if err != nil {
+		h.logger.Error("Failed to fetch user tasks", "err", err)
+		h.send(msg.Chat.ID, "Ошибка получения списка задач.")
+		return
+	}
+
+	if len(tasks) == 0 {
+		h.send(msg.Chat.ID, "📭 У вас нет активных задач.")
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📊 **Ваши активные задачи (%d):**\n\n", len(tasks)))
+
+	for _, t := range tasks {
+		// Иконка статуса
+		statusIcon := "🟢"
+		if t.Status == domain.TaskStateFailed {
+			statusIcon = "🔴"
+		} else if t.Status != domain.TaskStateIdle {
+			statusIcon = "🔄" // В процессе роллирования
+		}
+
+		// Формируем карточку задачи
+		sb.WriteString(fmt.Sprintf("%s **%s**\n", statusIcon, t.CurrentOptionSymbol))
+		sb.WriteString(fmt.Sprintf("├ 🎯 Триггер (Index): `%s`\n", t.TriggerPrice.String()))
+		sb.WriteString(fmt.Sprintf("├ 📦 Объем: `%s`\n", t.CurrentQty.String()))
+		sb.WriteString(fmt.Sprintf("└ ⚙️ Статус: `%s`\n", t.Status))
+		
+		if t.LastError != "" {
+			sb.WriteString(fmt.Sprintf("⚠️ Ошибка: %s\n", t.LastError))
+		}
+		sb.WriteString("\n")
+	}
+
+	h.send(msg.Chat.ID, sb.String())
 }
 
 func (h *Handler) cmdAdd(ctx context.Context, msg *tgbotapi.Message) {
@@ -412,22 +452,38 @@ func (h *Handler) processStep(ctx context.Context, msg *tgbotapi.Message, state 
         h.send(msg.Chat.ID, "Неверный шаг.")
         return
     }
-    
-    // Получаем user и api key снова
-    user, _ := h.userRepo.GetByTelegramID(ctx, msg.From.ID)
-    apiKey, _ := h.keyRepo.GetActiveByUserID(ctx, user.ID)
-    
-    trigger, _ := decimal.NewFromString(state.TempPrice)
-    sym, _ := domain.ParseOptionSymbol(state.TempSymbol)
+    sym, err := domain.ParseOptionSymbol(state.TempSymbol)
+	if err != nil {
+		h.logger.Error("Failed to parse symbol", "symbol", state.TempSymbol, "err", err)
+		h.send(msg.Chat.ID, "❌ Ошибка формата символа: "+state.TempSymbol)
+		return
+	}
 
-    task := &domain.Task{
-		UserID:              user.ID,
-		APIKeyID:            apiKey.ID,
+	// 2. Нормализуем тикер для Linear Stream (добавляем USDT)
+	underlying := sym.BaseCoin
+	if !strings.HasSuffix(underlying, "USDT") {
+		underlying += "USDT"
+	}
+
+	// 3. Подготовка данных (ПОЛУЧАЕМ РЕАЛЬНЫЙ ОБЪЕМ)
+	user, _ := h.userRepo.GetByTelegramID(ctx, msg.From.ID)
+	apiKey, _ := h.keyRepo.GetActiveByUserID(ctx, user.ID)
+	trigger, _ := decimal.NewFromString(state.TempPrice)
+
+    // Запрашиваем позицию, чтобы узнать объем
+    realQty := decimal.NewFromFloat(0.1) // Дефолт на случай ошибки
+    if pos, err := h.exchange.GetPosition(ctx, *apiKey, state.TempSymbol); err == nil && !pos.Qty.IsZero() {
+        realQty = pos.Qty
+    }
+
+	// 4. Создаем задачу
+	task := &domain.Task{
+		// ...
 		CurrentOptionSymbol: state.TempSymbol,
-		UnderlyingSymbol:    sym.BaseCoin,
+		UnderlyingSymbol:    underlying,
 		TriggerPrice:        trigger,
 		NextStrikeStep:      step,
-		CurrentQty:          decimal.NewFromFloat(0.1), // TODO: Брать реальное кол-во из позиции
+		CurrentQty:          realQty, // <--- ИСПОЛЬЗУЕМ РЕАЛЬНЫЙ ОБЪЕМ
 		Status:              domain.TaskStateIdle,
 	}
 	

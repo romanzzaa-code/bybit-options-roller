@@ -21,10 +21,12 @@ type OptionSymbol struct {
 // ParseOptionSymbol разбирает строку вида "ETH-30JAN24-2200-C"
 func ParseOptionSymbol(symbol string) (OptionSymbol, error) {
 	parts := strings.Split(symbol, "-")
-	if len(parts) != 4 {
+    // ИЗМЕНЕНО: Разрешаем 4 или 5 частей
+	if len(parts) < 4 {
 		return OptionSymbol{}, fmt.Errorf("invalid symbol format: %s", symbol)
 	}
 
+	// Strike всегда на 3-й позиции (индекс 2)
 	strike, err := decimal.NewFromString(parts[2])
 	if err != nil {
 		return OptionSymbol{}, fmt.Errorf("invalid strike: %s", parts[2])
@@ -32,7 +34,7 @@ func ParseOptionSymbol(symbol string) (OptionSymbol, error) {
 
 	return OptionSymbol{
 		Original: symbol,
-		BaseCoin: parts[0],
+		BaseCoin: parts[0], // Всегда берем первую часть (ETH, BTC)
 		Expiry:   parts[1],
 		Strike:   strike,
 		Side:     parts[3],

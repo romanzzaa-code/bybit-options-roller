@@ -118,6 +118,9 @@ func (s *RollerService) processLeg1(ctx context.Context, apiKey domain.APIKey, t
 		return s.taskRepo.UpdateTaskState(ctx, task.ID, domain.TaskStateCompleted, task.Version)
 	}
 
+	task.CurrentQty = position.Qty
+    log.Info("Updated Task Qty from Exchange Position", "real_qty", task.CurrentQty)
+
 	markPrice, err := s.exchange.GetMarkPrice(ctx, task.CurrentOptionSymbol)
 	if err != nil {
 		return fmt.Errorf("failed to get mark price for leg1: %w", err)
@@ -279,7 +282,7 @@ func (s *RollerService) handleError(ctx context.Context, task *domain.Task, err 
 // Если мы ПРОДАЕМ (Open Short / Close Long), мы готовы продать дешевле (MarkPrice - 20%).
 func (s *RollerService) calculateSafeLimitPrice(side string, markPrice decimal.Decimal) decimal.Decimal {
 	// 20% "запаса" для гарантии исполнения
-	slippageFactor := decimal.NewFromFloat(0.20) 
+	slippageFactor := decimal.NewFromFloat(0.10) 
 
 	if side == domain.SideBuy {
 		// Хотим купить: ставим лимитку ВЫШЕ рынка (Mark * 1.2)

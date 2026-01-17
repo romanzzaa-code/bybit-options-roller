@@ -11,6 +11,7 @@ type TaskRepository interface {
 	CreateTask(ctx context.Context, task *Task) error
 	GetTaskByID(ctx context.Context, id int64) (*Task, error)
 	GetActiveTasks(ctx context.Context) ([]Task, error)
+	GetActiveTasksByUserID(ctx context.Context, userID int64) ([]Task, error)
 
 	UpdateTaskState(ctx context.Context, id int64, newState TaskState, version int64) error
 	UpdateTaskSymbol(ctx context.Context, id int64, newSymbol string, newQty decimal.Decimal, version int64) error

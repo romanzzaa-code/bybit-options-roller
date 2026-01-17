@@ -110,7 +110,7 @@ func main() {
 		UserID:           user.ID,     // Ссылка на созданного юзера
 		APIKeyID:         apiKey.ID,   // Ссылка на созданный ключ
 		CurrentOptionSymbol: "BTC-26DEC26-100000-C", // Пример символа
-		UnderlyingSymbol:    "BTC",
+		UnderlyingSymbol:    "BTCUSDT",
 		TriggerPrice:        decimal.NewFromInt(150000), 
 		NextStrikeStep:      decimal.NewFromInt(1000),
 		CurrentQty:          decimal.NewFromFloat(0.1),

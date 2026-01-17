@@ -52,7 +52,7 @@ func (m *Manager) ReloadTasks(ctx context.Context) error {
 	m.logger.Info("🔄 Hot Reloading tasks...")
 
 	// 1. Идем в базу за свежим списком
-	newTasks, err := m.repo.GetActiveTasks(ctx)
+	newTasks, err := m.repo.GetActiveTasks(ctx) 
 	if err != nil {
 		return err
 	}

@@ -13,6 +13,32 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+func (r *TaskRepository) GetActiveTasks(ctx context.Context) ([]domain.Task, error) {
+	query := `
+		SELECT id, user_id, api_key_id, target_symbol, underlying_symbol, current_qty,
+			   trigger_price, next_strike_step, status, version, last_error,
+			   created_at, updated_at
+		FROM tasks
+		WHERE status IN ('IDLE', 'ROLL_INITIATED', 'LEG1_CLOSED')
+	`
+
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get active tasks: %w", err)
+	}
+	defer rows.Close()
+
+	var tasks []domain.Task
+	for rows.Next() {
+		task, err := r.scanRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, *task)
+	}
+	return tasks, nil
+}
+
 func (r *APIKeyRepository) GetActiveByUserID(ctx context.Context, userID int64) (*domain.APIKey, error) {
 	query := `
 		SELECT id, user_id, key_enc, secret_enc, label, is_valid, created_at
@@ -126,18 +152,20 @@ func (r *TaskRepository) GetTaskByID(ctx context.Context, id int64) (*domain.Tas
 	return r.scanTask(r.db.QueryRowContext(ctx, query, id))
 }
 
-func (r *TaskRepository) GetActiveTasks(ctx context.Context) ([]domain.Task, error) {
+// GetActiveTasksByUserID возвращает активные задачи конкретного пользователя
+func (r *TaskRepository) GetActiveTasksByUserID(ctx context.Context, userID int64) ([]domain.Task, error) {
 	query := `
 		SELECT id, user_id, api_key_id, target_symbol, underlying_symbol, current_qty,
 			   trigger_price, next_strike_step, status, version, last_error,
 			   created_at, updated_at
 		FROM tasks
-		WHERE status IN ('IDLE', 'ROLL_INITIATED', 'LEG1_CLOSED')
+		WHERE user_id = $1 AND status IN ('IDLE', 'ROLL_INITIATED', 'LEG1_CLOSED', 'LEG2_OPENING')
+		ORDER BY created_at DESC
 	`
 
-	rows, err := r.db.QueryContext(ctx, query)
+	rows, err := r.db.QueryContext(ctx, query, userID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get active tasks: %w", err)
+		return nil, fmt.Errorf("failed to get user tasks: %w", err)
 	}
 	defer rows.Close()
 
